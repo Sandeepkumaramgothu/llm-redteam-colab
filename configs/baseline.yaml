@@ -1,0 +1,10 @@
+run:
+  seeds_per_iter: 10
+  iterations: 1
+  max_new_tokens: 64
+  temperature: 0.7
+models:
+  target_model_name: google/flan-t5-small
+paths:
+  runs_dir: runs
+  seeds_path: src/storage/seeds.jsonl

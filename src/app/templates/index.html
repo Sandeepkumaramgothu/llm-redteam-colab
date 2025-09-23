@@ -1,0 +1,104 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Week 1 — Minimal UI</title>
+    <style>
+      body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+      button { padding: 0.6rem 1rem; }
+      .bar { width: 420px; height: 12px; background: #eee; border-radius: 6px; overflow: hidden; margin: 8px 0; }
+      .fill { height: 100%; background: #4a90e2; width: 0%; transition: width 0.2s; }
+      .muted { color: #666; font-size: 0.9rem; }
+      .ok { color: #0a0; }
+      .err { color: #a00; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    </style>
+  </head>
+  <body>
+    <h2>Week 1 — One-Iteration Demo (Flask + Polling)</h2>
+<p><a href="/report">Open latest report →</a></p>
+
+    <button id="start">Start</button> <button id="stop">Stop</button>
+    <div class="bar"><div id="fill" class="fill"></div></div>
+    <div id="phase" class="muted">phase: idle</div>
+    <div id="iter" class="muted">iter: 0</div>
+    <div id="done" class="muted"></div>
+    <pre id="result" class="muted mono"></pre>
+
+    <script>
+      // Helper: GET JSON from an endpoint
+      async function getJSON(url) {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return await r.json();
+      }
+
+      // Helper: POST JSON to an endpoint
+      async function postJSON(url, bodyObj) {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: bodyObj ? JSON.stringify(bodyObj) : null
+        });
+        const data = await r.json();
+        if (!r.ok || data.ok === false) {
+          throw new Error((data && data.error) || ("HTTP " + r.status));
+        }
+        return data;
+      }
+
+      let timer = null;
+
+      async function pollStatus() {
+        try {
+          const s = await getJSON("/status");
+          document.getElementById("phase").textContent = "phase: " + s.phase;
+          document.getElementById("iter").textContent  = "iter: " + s.iter;
+          document.getElementById("fill").style.width = (s.percent || 0) + "%";
+
+          if (s.phase === "done" || s.phase === "error") {
+            clearInterval(timer);
+            const res = await getJSON("/result").catch(() => null);
+            const done = document.getElementById("done");
+            done.innerHTML = (s.phase === "done")
+              ? "<b class=\"ok\">Done!</b> Artifacts saved."
+              : "<b class=\"err\">Error.</b> See error.json in run folder.";
+            document.getElementById("result").textContent = res ? JSON.stringify(res, null, 2) : "(no result)";
+          }
+        } catch (e) {
+          // keep polling; transient errors happen during startup
+          console.log("poll error:", e);
+        }
+      }
+
+      document.getElementById("start").onclick = async () => {
+        document.getElementById("done").textContent = "";
+        document.getElementById("result").textContent = "";
+        document.getElementById("fill").style.width = "0%";
+        document.getElementById("phase").textContent = "phase: starting...";
+        try {
+          await postJSON("/start", {});
+          // poll every 800ms
+          clearInterval(timer);
+          timer = setInterval(pollStatus, 800);
+        } catch (e) {
+          document.getElementById("done").innerHTML = "<b class=\"err\">" + e.message + "</b>";
+        }
+      };
+    
+      document.getElementById("stop").onclick = async () => {
+        try {
+          const res = await postJSON("/shutdown", {});
+          // reset UI
+          document.getElementById("fill").style.width = "0%";
+          document.getElementById("phase").textContent = "phase: stopped";
+          document.getElementById("iter").textContent  = "iter: 0";
+          document.getElementById("done").textContent  = "Server stopped.";
+          document.getElementById("result").textContent= "";
+        } catch (e) {
+          document.getElementById("done").textContent  = "Could not stop: " + e.message;
+        }
+      };
+    </script>
+  </body>
+</html>

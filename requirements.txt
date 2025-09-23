@@ -1,0 +1,7 @@
+flask==3.0.3
+transformers==4.44.2
+torch>=2.1.0
+datasets==2.21.0
+pydantic==2.9.2
+typer==0.12.5
+ujson==5.10.0
