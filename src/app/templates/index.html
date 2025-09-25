@@ -1,104 +1,156 @@
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Week 1 — Minimal UI</title>
-    <style>
-      body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
-      button { padding: 0.6rem 1rem; }
-      .bar { width: 420px; height: 12px; background: #eee; border-radius: 6px; overflow: hidden; margin: 8px 0; }
-      .fill { height: 100%; background: #4a90e2; width: 0%; transition: width 0.2s; }
-      .muted { color: #666; font-size: 0.9rem; }
-      .ok { color: #0a0; }
-      .err { color: #a00; }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
-    </style>
-  </head>
-  <body>
-    <h2>Week 1 — One-Iteration Demo (Flask + Polling)</h2>
-<p><a href="/report">Open latest report →</a></p>
+<head>
+  <meta charset="utf-8" />
+  <title>Red Team — Day 7 UI</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+    a { color: #1a73e8; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button { padding: 0.6rem 1rem; margin-right: 8px; }
+    .bar { width: 420px; height: 12px; background: #eee; border-radius: 6px; overflow: hidden; margin: 10px 0; }
+    .fill { height: 100%; background: #4a90e2; width: 0%; transition: width 0.2s; }
+    .muted { color: #666; font-size: 0.95rem; }
+    .ok { color: #0a0; }
+    .err { color: #a00; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>Red Team — One Iteration</h2>
+  <p><a href="report">Open latest report →</a></p>
 
-    <button id="start">Start</button> <button id="stop">Stop</button>
-    <div class="bar"><div id="fill" class="fill"></div></div>
-    <div id="phase" class="muted">phase: idle</div>
-    <div id="iter" class="muted">iter: 0</div>
-    <div id="done" class="muted"></div>
-    <pre id="result" class="muted mono"></pre>
+  <button id="start">Start</button>
+  <button id="export">Export Report</button>
+  <button id="zip">Zip Run</button>
+  <button id="stop">Stop</button>
 
-    <script>
-      // Helper: GET JSON from an endpoint
-      async function getJSON(url) {
-        const r = await fetch(url);
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return await r.json();
-      }
+  <div style="margin:12px 0; padding:10px; background:#fafafa; border:1px solid #eee; border-radius:8px; width:fit-content">
+    <label>Seed source:
+      <select id="seed_source">
+        <option value="dna" selected>Hugging Face: Do-Not-Answer</option>
+        <option value="local">Local file (src/storage/seeds.jsonl)</option>
+      </select>
+    </label>
+    <label style="margin-left:10px">Count:
+      <input id="seed_count" type="number" value="20" min="1" max="939" style="width:80px" />
+    </label>
+    <label style="margin-left:10px">HF dataset id:
+      <input id="hf_id" type="text" value="LibrAI/do-not-answer" style="width:240px" />
+    </label>
+  </div>
 
-      // Helper: POST JSON to an endpoint
-      async function postJSON(url, bodyObj) {
-        const r = await fetch(url, {
-          method: "POST",
-          headers: {"Content-Type":"application/json"},
-          body: bodyObj ? JSON.stringify(bodyObj) : null
-        });
-        const data = await r.json();
-        if (!r.ok || data.ok === false) {
-          throw new Error((data && data.error) || ("HTTP " + r.status));
-        }
-        return data;
-      }
+  <div class="bar"><div id="fill" class="fill"></div></div>
+  <div id="phase" class="muted">phase: idle</div>
+  <div id="iter" class="muted">iter: 0</div>
+  <div id="done" class="muted"></div>
+  <pre id="result" class="muted mono"></pre>
 
-      let timer = null;
+  <script>
+    function toProxy(relPath) {
+      if (!relPath) return window.location.href;
+      if (relPath.startsWith("/")) relPath = relPath.slice(1);
+      return new URL(relPath, window.location.href).href;
+    }
+    async function getJSON(url) {
+      const r = await fetch(toProxy(url));
+      const ct = r.headers.get("content-type") || "";
+      const txt = await r.text();
+      if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,160)}`);
+      const data = JSON.parse(txt);
+      if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+      return data;
+    }
+    async function postJSON(url, body) {
+      const r = await fetch(toProxy(url), { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body||{}) });
+      const ct = r.headers.get("content-type") || "";
+      const txt = await r.text();
+      if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,160)}`);
+      const data = JSON.parse(txt);
+      if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+      return data;
+    }
+    async function blobDownload(relPath, filename) {
+      const res = await fetch(toProxy(relPath + (relPath.includes("?") ? "&" : "?") + "t=" + Date.now()));
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename || relPath.split("/").pop() || "download";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+    }
 
-      async function pollStatus() {
-        try {
-          const s = await getJSON("/status");
-          document.getElementById("phase").textContent = "phase: " + s.phase;
-          document.getElementById("iter").textContent  = "iter: " + s.iter;
-          document.getElementById("fill").style.width = (s.percent || 0) + "%";
-
-          if (s.phase === "done" || s.phase === "error") {
-            clearInterval(timer);
-            const res = await getJSON("/result").catch(() => null);
-            const done = document.getElementById("done");
-            done.innerHTML = (s.phase === "done")
-              ? "<b class=\"ok\">Done!</b> Artifacts saved."
-              : "<b class=\"err\">Error.</b> See error.json in run folder.";
-            document.getElementById("result").textContent = res ? JSON.stringify(res, null, 2) : "(no result)";
-          }
-        } catch (e) {
-          // keep polling; transient errors happen during startup
-          console.log("poll error:", e);
-        }
-      }
-
-      document.getElementById("start").onclick = async () => {
-        document.getElementById("done").textContent = "";
-        document.getElementById("result").textContent = "";
-        document.getElementById("fill").style.width = "0%";
-        document.getElementById("phase").textContent = "phase: starting...";
-        try {
-          await postJSON("/start", {});
-          // poll every 800ms
+    let timer = null;
+    async function pollStatus() {
+      try {
+        const s = await getJSON("status");
+        document.getElementById("phase").textContent = "phase: " + s.phase;
+        document.getElementById("iter").textContent  = "iter: " + s.iter;
+        document.getElementById("fill").style.width = (s.percent || 0) + "%";
+        if (s.phase === "done" || s.phase === "error") {
           clearInterval(timer);
-          timer = setInterval(pollStatus, 800);
-        } catch (e) {
-          document.getElementById("done").innerHTML = "<b class=\"err\">" + e.message + "</b>";
+          try {
+            const res = await getJSON("result");
+            document.getElementById("result").textContent = JSON.stringify(res, null, 2);
+            document.getElementById("done").innerHTML = (s.phase === "done")
+              ? "<b class='ok'>Done!</b>"
+              : "<b class='err'>Error. See error.json in run folder.</b>";
+          } catch (e) {
+            document.getElementById("done").innerHTML = "<b class='err'>Could not read result: " + e.message + "</b>";
+          }
         }
-      };
-    
-      document.getElementById("stop").onclick = async () => {
-        try {
-          const res = await postJSON("/shutdown", {});
-          // reset UI
-          document.getElementById("fill").style.width = "0%";
-          document.getElementById("phase").textContent = "phase: stopped";
-          document.getElementById("iter").textContent  = "iter: 0";
-          document.getElementById("done").textContent  = "Server stopped.";
-          document.getElementById("result").textContent= "";
-        } catch (e) {
-          document.getElementById("done").textContent  = "Could not stop: " + e.message;
-        }
-      };
-    </script>
-  </body>
+      } catch (e) { console.log("poll error:", e); }
+    }
+
+    document.getElementById("start").onclick = async () => {
+      document.getElementById("done").textContent = "";
+      document.getElementById("result").textContent = "";
+      document.getElementById("fill").style.width = "0%";
+      document.getElementById("phase").textContent = "phase: starting...";
+      try {
+        await postJSON("start", {
+          seed_source:  document.getElementById("seed_source").value,
+          seed_count:   parseInt(document.getElementById("seed_count").value, 10),
+          hf_dataset_id:document.getElementById("hf_id").value
+        });
+        clearInterval(timer);
+        timer = setInterval(pollStatus, 800);
+      } catch (e) {
+        document.getElementById("done").innerHTML = "<b class='err'>Start failed:</b> " + e.message;
+      }
+    };
+
+    document.getElementById("export").onclick = async () => {
+      try {
+        let rid=null; try{ rid=(await getJSON("result")).run_id; }catch(_){}
+        const d = await postJSON("export_report", rid? {run_id: rid} : {});
+        await blobDownload(d.report_path, "report.html");
+        document.getElementById("done").innerHTML = "<b class='ok'>Report exported.</b>";
+      } catch (e) {
+        document.getElementById("done").innerHTML = "Export failed: " + e.message;
+      }
+    };
+
+    document.getElementById("zip").onclick = async () => {
+      try {
+        let rid=null; try{ rid=(await getJSON("result")).run_id; }catch(_){}
+        const d = await postJSON("zip_run", rid? {run_id: rid} : {});
+        await blobDownload(d.zip_path, d.zip_path.split("/").pop());
+        document.getElementById("done").innerHTML = "<b class='ok'>Zip ready.</b>";
+      } catch (e) {
+        document.getElementById("done").innerHTML = "Zip failed: " + e.message;
+      }
+    };
+
+    document.getElementById("stop").onclick = async () => {
+      try {
+        const d = await postJSON("shutdown", {});
+        document.getElementById("done").textContent = d.msg || "Server stopping...";
+      } catch (e) {
+        document.getElementById("done").textContent = "Could not stop: " + e.message;
+      }
+    };
+  </script>
+</body>
 </html>

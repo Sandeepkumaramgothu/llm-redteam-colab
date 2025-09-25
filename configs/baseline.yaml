@@ -1,10 +1,12 @@
 run:
-  seeds_per_iter: 10
-  iterations: 1
-  max_new_tokens: 64
-  temperature: 0.7
+  seeds_per_iter: 20        # try 20 seeds in each run
+  iterations: 1             # keep 1 while testing
+  max_new_tokens: 64        # generation length limit
+  temperature: 0.7          # randomness (0 strict, 1 creative)
+
 models:
-  target_model_name: google/flan-t5-small
+  target_model_name: "google/flan-t5-small"
+
 paths:
-  runs_dir: runs
-  seeds_path: src/storage/seeds.jsonl
+  runs_dir: "runs"
+  seeds_path: "src/storage/seeds.jsonl"

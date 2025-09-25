@@ -23,6 +23,7 @@
       <p><a href="/">← Home</a></p>
     {% else %}
       <h2>Run Report</h2>
+<p><button id="export2">Export report.html</button> <button id="zip2">Zip this run</button> <a href="/">Home</a></p>
       <div class="muted">Run folder: <span class="mono">{{ run_id }}</span></div>
 
       <h3>Summary</h3>
@@ -62,5 +63,60 @@
 
       <p><a href="/">← Back to Home</a></p>
     {% endif %}
-  </body>
+  
+<script>
+      // Keep Colab's /proxy/PORT/ prefix when building links:
+      function toProxy(relPath) {
+        // ensure no leading slash so URL() keeps the current base
+        if (relPath.startsWith("/")) relPath = relPath.slice(1);
+        return new URL(relPath, window.location.href).href;
+      }
+async function postJSON(url, bodyObj) {
+  const href = toProxy(url);
+  const r = await fetch(href, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(bodyObj || {})
+  });
+  const ct = r.headers.get("content-type") || "";
+  const text = await r.text();
+  let data = null;
+  if (ct.includes("application/json")) {
+    try { data = JSON.parse(text); } catch(e) { throw new Error("Bad JSON from server: " + e.message + " :: " + text.slice(0,160)); }
+  } else {
+    throw new Error(`HTTP ${r.status} ${ct} :: ${text.slice(0,160)}`);
+  }
+  if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+  return data;
+},
+    body: JSON.stringify(bodyObj || {})
+  });
+  const ct = r.headers.get("content-type") || "";
+  const text = await r.text();
+  let data = null;
+  if (ct.includes("application/json")) {
+    try { data = JSON.parse(text); } catch(e) { throw new Error("Bad JSON from server: " + e.message + " :: " + text.slice(0,160)); }
+  } else {
+    throw new Error(`HTTP ${r.status} ${ct} :: ${text.slice(0,160)}`);
+  }
+  if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+  return data;
+}, body: JSON.stringify(bodyObj||{})});
+  const data = await r.json().catch(()=> ({}));
+  if (!r.ok || data.ok === false) throw new Error((data && data.error) || ("HTTP " + r.status));
+  return data;
+}
+document.getElementById("export2").onclick = async () => {
+  try { const d = await postJSON("export_report", {"run_id": "{{ run_id }}"});
+        window.open(toProxy("dl/" + d.report_path.replace(/^runs\//, "")), "_blank"); }
+  catch(e){ alert("Export failed: " + e.message); }
+};
+document.getElementById("zip2").onclick = async () => {
+  try { const d = await postJSON("/zip_run", {"run_id": "{{ run_id }}"});
+        window.open(toProxy(d.zip_path), "_blank"); }
+  catch(e){ alert("Zip failed: " + e.message); }
+};
+</script>
+
+</body>
 </html>
