@@ -1,8 +1,4 @@
 # src/data/seed_loader.py
-# Tiny helper that prepares "seeds.jsonl" for the engine.
-# - "dna" source: sample k random prompts from the HF DNA dataset (939 rows)
-# - "local" source: sample k random prompts from your local seeds file
-
 import os, json, random
 from typing import List, Dict, Optional
 
@@ -18,12 +14,11 @@ def read_local_jsonl(jsonl_path: str) -> List[Dict]:
             try:
                 rows.append(json.loads(line))
             except Exception:
-                # ignore malformed lines so one bad row doesn't break everything
                 pass
     return rows
 
 def _rng(seed: Optional[int]) -> random.Random:
-    """Return a random generator. seed=None → SystemRandom (very random)."""
+    """seed=None → SystemRandom (very random). seed=int → reproducible."""
     if seed is None:
         return random.SystemRandom()
     return random.Random(int(seed))
@@ -35,19 +30,14 @@ def load_hf_dna_prompts(
     max_items: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> List[Dict]:
-    """
-    Load the DNA dataset and return a truly random subset (size=max_items).
-    Different seed => different subset. seed=None => different every call.
-    """
+    """Load DNA and return a truly random subset of size=max_items."""
     try:
         from datasets import load_dataset
     except Exception as e:
         raise RuntimeError("Please `pip install datasets` to use the DNA loader") from e
 
-    # 1) Load the split (DNA has 939 rows in 'train')
     ds = load_dataset(dataset_id, split=split)
 
-    # 2) Build the full pool in our simple shape
     pool: List[Dict] = []
     for i, row in enumerate(ds):
         txt = row.get(text_column)
@@ -56,13 +46,11 @@ def load_hf_dna_prompts(
         rid = row.get("id", i)
         pool.append({"id": f"dna-{rid}", "text": txt.strip()})
 
-    # 3) Sample exactly max_items without replacement if requested
     if isinstance(max_items, int) and 0 < max_items < len(pool):
         rng = _rng(seed)
         idxs = rng.sample(range(len(pool)), k=max_items)
         return [pool[i] for i in idxs]
 
-    # Else return pool (or head if equal)
     return pool if max_items is None else pool[:max_items]
 
 def write_jsonl(rows: List[Dict], out_path: str):
@@ -83,7 +71,6 @@ def prepare_seeds(
 ) -> Dict:
     """
     Make out_path as JSONL with exactly `count` rows when possible, selected randomly.
-    Returns a tiny info dict for logging.
     """
     if source == "local":
         rows = read_local_jsonl(local_path)
@@ -101,7 +88,7 @@ def prepare_seeds(
             split=hf_split,
             text_column=hf_text_column,
             max_items=count,
-            seed=seed,          # None => very random; int => reproducible
+            seed=seed,
         )
         write_jsonl(rows, out_path)
         return {"source": "dna", "dataset_id": hf_dataset_id, "kept": len(rows), "out_path": out_path}

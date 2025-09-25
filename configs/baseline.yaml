@@ -1,6 +1,6 @@
 run:
-  seeds_per_iter: 20        # try 20 seeds in each run
-  iterations: 1             # keep 1 while testing
+  seeds_per_iter: 100       # ⬅️ process 100 prompts each run
+  iterations: 1             # keep 1 iteration while testing
   max_new_tokens: 64        # generation length limit
   temperature: 0.7          # randomness (0 strict, 1 creative)
 

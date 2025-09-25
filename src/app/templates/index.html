@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Red Team — Day 7 UI</title>
+  <title>Red Team — Week 2 (100 seeds default)</title>
   <style>
     body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
     a { color: #1a73e8; text-decoration: none; }
@@ -18,7 +18,7 @@
 </head>
 <body>
   <h2>Red Team — One Iteration</h2>
-  <p><a href="report">Open latest report →</a></p>
+  <p><a href="report">Open latest report →</a> (Preview now shows <b>ALL</b> items)</p>
 
   <button id="start">Start</button>
   <button id="export">Export Report</button>
@@ -33,11 +33,14 @@
       </select>
     </label>
     <label style="margin-left:10px">Count:
-      <input id="seed_count" type="number" value="20" min="1" max="939" style="width:80px" />
+      <input id="seed_count" type="number" value="100" min="1" max="939" style="width:80px" />
     </label>
     <label style="margin-left:10px">HF dataset id:
       <input id="hf_id" type="text" value="LibrAI/do-not-answer" style="width:240px" />
     </label>
+    <div class="muted" style="margin-top:6px">
+      Tip: Change <b>Count</b> here to prepare a different number next run.
+    </div>
   </div>
 
   <div class="bar"><div id="fill" class="fill"></div></div>

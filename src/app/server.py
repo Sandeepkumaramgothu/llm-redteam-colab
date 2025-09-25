@@ -4,12 +4,11 @@ import os, sys, json, glob, threading, time, pathlib
 from zipfile import ZipFile, ZIP_DEFLATED
 from flask import Flask, jsonify, request, render_template, send_from_directory
 
-# Absolute paths so spawned processes always know where files live
+# Absolute paths
 ROOT = pathlib.Path(__file__).resolve().parents[2]   # .../redteam_app
 RUNS_DIR = ROOT / "runs"
 TEMPLATES_DIR = ROOT / "src" / "app" / "templates"
 
-# Make project root importable
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
@@ -21,23 +20,18 @@ from src.data.seed_loader import prepare_seeds
 app = Flask(__name__, template_folder=str(TEMPLATES_DIR))
 _current = {"engine": None, "thread": None}
 
-# ---------------- helpers ----------------
+# ------------- helpers -------------
 
 def _now_seed() -> int:
-    """Fresh random seed: use current time (ns) so each run is different."""
+    """Fresh random seed each run."""
     return time.time_ns() % 1_000_000
 
 def _latest_run_id() -> str | None:
-    """Newest run directory name under runs/ (or None)."""
     RUNS_DIR.mkdir(exist_ok=True)
     dirs = sorted([p.name for p in RUNS_DIR.glob("*") if p.is_dir()])
     return dirs[-1] if dirs else None
 
 def _resolve_run(run_identifier: str | None) -> tuple[str, pathlib.Path] | None:
-    """
-    Accept '2025...' OR 'runs/2025...' OR None.
-    Return (run_id, absolute_dir) OR None.
-    """
     if not run_identifier:
         rid = _latest_run_id()
         if not rid:
@@ -48,28 +42,36 @@ def _resolve_run(run_identifier: str | None) -> tuple[str, pathlib.Path] | None:
         rid = rid.split("/", 1)[1]
     return rid, RUNS_DIR / rid
 
-def _read_samples_for_preview(run_dir: pathlib.Path, k: int = 20) -> list[dict]:
-    """Read up to k interaction rows for the preview page."""
+def _read_samples_for_preview(run_dir: pathlib.Path, k: int | None = None) -> list[dict]:
+    """
+    Read up to k interaction rows for the preview page.
+    k=None => read ALL rows safely.
+    """
     out: list[dict] = []
     ip = run_dir / "interactions.jsonl"
     if not ip.exists():
         return out
     with open(ip, "r", encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
-            if i > k: break
             line = line.strip()
-            if not line: continue
+            if not line:
+                continue
             try:
                 out.append(json.loads(line))
             except Exception:
                 pass
+            if isinstance(k, int) and i >= k:
+                break
     return out
 
-def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int = 20) -> str:
-    """Try fancy exporter; if it fails, write a simple, safe HTML."""
+def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int | None = None) -> str:
+    """
+    Try fancy exporter; if it fails, build a simple HTML. max_samples=None => ALL.
+    """
     try:
         from scripts.mk_report import make_html as _fancy
-        return _fancy(str(run_dir), max_samples=max_samples)
+        # Pass a very large number if None (so exporter shows all)
+        return _fancy(str(run_dir), max_samples=(10**9 if max_samples is None else max_samples))
     except Exception:
         pass
 
@@ -88,9 +90,10 @@ def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int = 20) -> str:
     asr = metrics.get("asr", "")
 
     rows = []
+    # Read ALL if max_samples is None
     for i, rec in enumerate(_read_samples_for_preview(run_dir, k=max_samples), start=1):
         prompt = esc(rec.get("prompt", ""))
-        out = esc(rec.get("output", ""))[:2000]
+        out = esc(rec.get("output", ""))[:200000]  # big cap to avoid runaway HTML
         rw = rec.get("reward") or {}
         score = esc(rw.get("score", ""))
         level = esc(rw.get("level", ""))
@@ -115,7 +118,7 @@ def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int = 20) -> str:
 {''.join(rows)}
 </table></body></html>"""
 
-# ---------------- routes ----------------
+# ------------- routes -------------
 
 @app.get("/")
 def home():
@@ -125,8 +128,9 @@ def home():
 def start():
     """
     Start a run:
-    - prepare seeds.jsonl (dna/local)
-    - run the engine in a background thread
+    - Prepare seeds.jsonl (dna/local)
+    - Run the engine in a background thread
+    Defaults: PREPARE 100 seeds from DNA and process 100 seeds this run.
     """
     if _current["thread"] and _current["thread"].is_alive():
         return jsonify({"ok": False, "error": "run_in_progress"}), 400
@@ -138,11 +142,11 @@ def start():
 
     payload = request.get_json(silent=True) or {}
     seed_source   = payload.get("seed_source", "dna")
-    seed_count    = int(payload.get("seed_count", 20))
+    seed_count    = int(payload.get("seed_count", 100))   # ⬅️ DEFAULT PREPARED COUNT = 100
     hf_dataset_id = payload.get("hf_dataset_id", "LibrAI/do-not-answer")
     hf_split      = payload.get("hf_split", "train")
     hf_text_col   = payload.get("hf_text_column", "question")
-    shuffle_seed  = int(payload.get("seed", _now_seed()))   # fresh random each run
+    shuffle_seed  = int(payload.get("seed", time.time_ns() % 1_000_000))
 
     seeds_out = cfg.paths.seeds_path  # "src/storage/seeds.jsonl"
 
@@ -203,7 +207,7 @@ def result():
 
 @app.get("/report")
 def report():
-    # Show latest (or chosen) run with up to 20 preview samples
+    # Preview page: SHOW ALL interactions for latest (or chosen) run
     rid = request.args.get("run_id")
     resolved = _resolve_run(rid)
     if not resolved:
@@ -218,15 +222,13 @@ def report():
         except Exception:
             metrics = {}
 
-    samples = _read_samples_for_preview(run_dir, k=20)
+    samples = _read_samples_for_preview(run_dir, k=None)  # ⬅️ ALL for preview
     return render_template("report.html", found=True, run_id=f"runs/{run_id}", metrics=metrics, samples=samples)
 
-# Serve files from absolute runs/ folder
 @app.get("/runs/<path:subpath>")
 def serve_runs(subpath: str):
     return send_from_directory(str(RUNS_DIR), subpath, as_attachment=False)
 
-# Force-download from runs/ folder
 @app.get("/dl/<path:subpath>")
 def download_runs(subpath: str):
     return send_from_directory(str(RUNS_DIR), subpath, as_attachment=True)
@@ -239,7 +241,7 @@ def export_report():
         if not run_dir:
             return jsonify({"ok": False, "error": "no_runs"}), 400
 
-        html_out = _make_report_html_safe(run_dir, max_samples=20)
+        html_out = _make_report_html_safe(run_dir, max_samples=None)  # ⬅️ ALL in exported report
         out_path = run_dir / "report.html"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
