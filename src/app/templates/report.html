@@ -1,122 +1,49 @@
+{% if not found %}
+<!doctype html><meta charset="utf-8">
+<h3>No run found yet</h3>
+<p>Click <a href="/">Start</a> to create one.</p>
+{% else %}
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Run Report</title>
-    <style>
-      body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
-      h2 { margin-bottom: 0.25rem; }
-      .muted { color: #666; font-size: 0.95rem; }
-      .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
-      table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
-      th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
-      th { background: #f6f6f6; }
-      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eef; }
-      a { color: #1a73e8; text-decoration: none; }
-      a:hover { text-decoration: underline; }
-    </style>
-  </head>
-  <body>
-    {% if not found %}
-      <h2>No runs yet</h2>
-      <p class="muted">Please go back to the home page and click Start first.</p>
-      <p><a href="/">← Home</a></p>
-    {% else %}
-      <h2>Run Report</h2>
-<p><button id="export2">Export report.html</button> <button id="zip2">Zip this run</button> <a href="/">Home</a></p>
-      <div class="muted">Run folder: <span class="mono">{{ run_id }}</span></div>
-
-      <h3>Summary</h3>
-      <ul>
-        <li><b>Count</b>: {{ metrics.count }}</li>
-        <li><b>ASR</b>: {{ metrics.asr }}</li>
-      </ul>
-
-      <h3>Artifacts</h3>
-      <ul>
-        <li><a href="/{{ run_id }}/config_resolved.json" target="_blank">config_resolved.json</a></li>
-        <li><a href="/{{ run_id }}/metrics.json" target="_blank">metrics.json</a></li>
-        <li><a href="/{{ run_id }}/interactions.jsonl" target="_blank">interactions.jsonl</a></li>
-        <li><a href="/{{ run_id }}/status.json" target="_blank">status.json</a></li>
-      </ul>
-
-      <h3>First few samples</h3>
-      <table>
-        <tr>
-          <th>#</th>
-          <th>Prompt</th>
-          <th>Model Output</th>
-          <th>Reward (score, level)</th>
-        </tr>
-        {% for s in samples %}
-        <tr>
-          <td>{{ loop.index }}</td>
-          <td class="mono">{{ s.prompt }}</td>
-          <td class="mono">{{ s.output[:500] }}{% if s.output|length > 500 %}…{% endif %}</td>
-          <td>
-            <div class="pill">score: {{ s.reward.score }}</div>
-            <div class="pill">level: {{ s.reward.level }}</div>
-          </td>
-        </tr>
-        {% endfor %}
-      </table>
-
-      <p><a href="/">← Back to Home</a></p>
-    {% endif %}
-  
-<script>
-      // Keep Colab's /proxy/PORT/ prefix when building links:
-      function toProxy(relPath) {
-        // ensure no leading slash so URL() keeps the current base
-        if (relPath.startsWith("/")) relPath = relPath.slice(1);
-        return new URL(relPath, window.location.href).href;
-      }
-async function postJSON(url, bodyObj) {
-  const href = toProxy(url);
-  const r = await fetch(href, {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify(bodyObj || {})
-  });
-  const ct = r.headers.get("content-type") || "";
-  const text = await r.text();
-  let data = null;
-  if (ct.includes("application/json")) {
-    try { data = JSON.parse(text); } catch(e) { throw new Error("Bad JSON from server: " + e.message + " :: " + text.slice(0,160)); }
-  } else {
-    throw new Error(`HTTP ${r.status} ${ct} :: ${text.slice(0,160)}`);
-  }
-  if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
-  return data;
-},
-    body: JSON.stringify(bodyObj || {})
-  });
-  const ct = r.headers.get("content-type") || "";
-  const text = await r.text();
-  let data = null;
-  if (ct.includes("application/json")) {
-    try { data = JSON.parse(text); } catch(e) { throw new Error("Bad JSON from server: " + e.message + " :: " + text.slice(0,160)); }
-  } else {
-    throw new Error(`HTTP ${r.status} ${ct} :: ${text.slice(0,160)}`);
-  }
-  if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
-  return data;
-}, body: JSON.stringify(bodyObj||{})});
-  const data = await r.json().catch(()=> ({}));
-  if (!r.ok || data.ok === false) throw new Error((data && data.error) || ("HTTP " + r.status));
-  return data;
-}
-document.getElementById("export2").onclick = async () => {
-  try { const d = await postJSON("export_report", {"run_id": "{{ run_id }}"});
-        window.open(toProxy("dl/" + d.report_path.replace(/^runs\//, "")), "_blank"); }
-  catch(e){ alert("Export failed: " + e.message); }
-};
-document.getElementById("zip2").onclick = async () => {
-  try { const d = await postJSON("/zip_run", {"run_id": "{{ run_id }}"});
-        window.open(toProxy(d.zip_path), "_blank"); }
-  catch(e){ alert("Zip failed: " + e.message); }
-};
-</script>
-
+<head>
+  <meta charset="utf-8">
+  <title>Run Preview</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+    .box { border:1px solid #ddd; padding:10px; border-radius:8px; background:#fafafa; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+    table { border-collapse: collapse; width: 100%; }
+    th,td { border:1px solid #ddd; padding:6px; vertical-align: top; }
+    th { background:#f6f6f6; }
+  </style>
+</head>
+<body>
+  <h2>Run Preview</h2>
+  <div class="box">
+    <h3>Run Settings</h3>
+    <ul>
+      <li><b>run:</b> {{ run_id }}</li>
+      <li><b>target model:</b> {{ settings.get("target_model_name","") }}</li>
+      <li><b>temperature:</b> {{ settings.get("temperature","") }}</li>
+      <li><b>max_new_tokens:</b> {{ settings.get("max_new_tokens","") }}</li>
+      <li><b>seed source:</b> {{ settings.get("seed_source","") }}</li>
+      <li><b>prepared count:</b> {{ settings.get("prepared_count","") }}</li>
+    </ul>
+  </div>
+  <table>
+    <tr><th>#</th><th>Prompt</th><th>Output</th><th>Reward</th></tr>
+    {% for rec in samples %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td class="mono">{{ rec.get("prompt","") }}</td>
+        <td class="mono">{{ rec.get("output","") }}</td>
+        <td class="mono">
+          {% set rw = rec.get("reward") or {} %}
+          score={{ rw.get("score","") }} level={{ rw.get("level","") }}
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
 </body>
 </html>
+{% endif %}

@@ -1,6 +1,6 @@
-from __future__ import annotations
+# src/core/config.py
 from dataclasses import dataclass
-import yaml
+import yaml, pathlib
 
 @dataclass
 class RunConfig:
@@ -14,7 +14,7 @@ class ModelConfig:
     target_model_name: str
 
 @dataclass
-class PathsConfig:
+class PathConfig:
     runs_dir: str
     seeds_path: str
 
@@ -22,14 +22,17 @@ class PathsConfig:
 class AppConfig:
     run: RunConfig
     models: ModelConfig
-    paths: PathsConfig
+    paths: PathConfig
 
-def load_config(path: str) -> AppConfig:
-    """Read configs/baseline.yaml and return a typed AppConfig."""
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
-
-    run = RunConfig(**raw["run"])
-    models = ModelConfig(**raw["models"])
-    paths = PathsConfig(**raw["paths"])
+def load_config(path: str) -> 'AppConfig':
+    p = pathlib.Path(path)
+    data = yaml.safe_load(p.read_text(encoding="utf-8"))
+    run = RunConfig(
+        seeds_per_iter=int(data["run"]["seeds_per_iter"]),
+        iterations=int(data["run"]["iterations"]),
+        max_new_tokens=int(data["run"]["max_new_tokens"]),
+        temperature=float(data["run"]["temperature"]),
+    )
+    models = ModelConfig(target_model_name=str(data["models"]["target_model_name"]))
+    paths  = PathConfig(runs_dir=str(data["paths"]["runs_dir"]), seeds_path=str(data["paths"]["seeds_path"]))
     return AppConfig(run=run, models=models, paths=paths)

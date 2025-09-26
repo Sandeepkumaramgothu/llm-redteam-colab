@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Red Team — Colab (Local default)</title>
+  <title>Red Team — Day 8 (Generation Controls)</title>
   <style>
     body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
     a { color: #1a73e8; text-decoration: none; }
@@ -14,10 +14,12 @@
     .ok { color: #0a0; }
     .err { color: #a00; }
     .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+    .box { padding:10px; border:1px solid #eee; border-radius:8px; background:#fafafa; margin: 10px 0; }
+    label { margin-right: 10px; }
   </style>
 </head>
 <body>
-  <h2>Red Team (Colab)</h2>
+  <h2>Red Team — Day 8</h2>
   <p><a href="report">Open latest report →</a> (Preview shows <b>ALL</b> items)</p>
 
   <button id="start">Start</button>
@@ -25,22 +27,32 @@
   <button id="zip">Zip Run</button>
   <button id="stop">Stop</button>
 
-  <div style="margin:12px 0; padding:10px; background:#fafafa; border:1px solid #eee; border-radius:8px; width:fit-content">
-    <label>Seed source:
+  <div class="box">
+    <h3>Seeds</h3>
+    <label>Source:
       <select id="seed_source">
         <option value="local" selected>Local (src/storage/seeds.json or seeds.jsonl)</option>
         <option value="dna">Hugging Face: Do-Not-Answer</option>
       </select>
     </label>
-    <label style="margin-left:10px">Count:
+    <label>Count:
       <input id="seed_count" type="number" placeholder="(auto for local: ALL rows)" style="width:160px" />
     </label>
-    <label style="margin-left:10px">HF dataset id:
-      <input id="hf_id" type="text" value="LibrAI/do-not-answer" style="width:240px" />
+    <label>HF dataset id:
+      <input id="hf_id" type="text" value="LibrAI/do-not-answer" style="width:260px" />
     </label>
-    <div class="muted" style="margin-top:6px">
-      With <b>Local</b>, leave <b>Count</b> blank to run ALL rows from your file.
-    </div>
+    <div class="muted">Tip: With <b>Local</b>, leave <b>Count</b> blank to use ALL rows.</div>
+  </div>
+
+  <div class="box">
+    <h3>Generation Controls (new!)</h3>
+    <label>Temperature (0.0 to 1.0):
+      <input id="temperature" type="number" step="0.1" min="0" max="1" value="0.7" style="width:80px" />
+    </label>
+    <label>Max new tokens (1 to 512):
+      <input id="max_new_tokens" type="number" min="1" max="512" value="64" style="width:100px" />
+    </label>
+    <div class="muted">Lower temperature = safer/stricter; higher = more creative.</div>
   </div>
 
   <div class="bar"><div id="fill" class="fill"></div></div>
@@ -50,11 +62,13 @@
   <pre id="result" class="muted mono"></pre>
 
   <script>
+    // Turn a relative path into a full URL in Colab.
     function toProxy(relPath) {
       if (!relPath) return window.location.href;
       if (relPath.startsWith("/")) relPath = relPath.slice(1);
       return new URL(relPath, window.location.href).href;
     }
+    // GET JSON helper (errors if content-type is not JSON).
     async function getJSON(url) {
       const r = await fetch(toProxy(url));
       const ct = r.headers.get("content-type") || "";
@@ -64,6 +78,7 @@
       if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
       return data;
     }
+    // POST JSON helper (same strictness).
     async function postJSON(url, body) {
       const r = await fetch(toProxy(url), { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body||{}) });
       const ct = r.headers.get("content-type") || "";
@@ -73,6 +88,7 @@
       if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
       return data;
     }
+    // Download any relative path as a file using a Blob.
     async function blobDownload(relPath, filename) {
       const res = await fetch(toProxy(relPath + (relPath.includes("?") ? "&" : "?") + "t=" + Date.now()));
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -106,6 +122,7 @@
       } catch (e) { console.log("poll error:", e); }
     }
 
+    // When you click Start, we collect all inputs and send them to /start.
     document.getElementById("start").onclick = async () => {
       document.getElementById("done").textContent = "";
       document.getElementById("result").textContent = "";
@@ -115,9 +132,11 @@
         const rawCount = (document.getElementById("seed_count").value || "").trim();
         const countVal = rawCount === "" ? null : parseInt(rawCount, 10);
         await postJSON("start", {
-          seed_source:  document.getElementById("seed_source").value,
-          seed_count:   countVal,
-          hf_dataset_id:document.getElementById("hf_id").value
+          seed_source:    document.getElementById("seed_source").value,
+          seed_count:     countVal,
+          hf_dataset_id:  document.getElementById("hf_id").value,
+          temperature:    parseFloat(document.getElementById("temperature").value),
+          max_new_tokens: parseInt(document.getElementById("max_new_tokens").value, 10)
         });
         clearInterval(timer);
         timer = setInterval(pollStatus, 800);

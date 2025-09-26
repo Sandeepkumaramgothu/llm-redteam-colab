@@ -4,10 +4,13 @@ import os, sys, json, glob, threading, time, pathlib
 from zipfile import ZipFile, ZIP_DEFLATED
 from flask import Flask, jsonify, request, render_template, send_from_directory
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+# --- absolute paths based on this file location ---
+ROOT = pathlib.Path(__file__).resolve().parents[2]   # project root
+CFG_PATH = ROOT / "configs" / "baseline.yaml"        # <-- absolute config
 RUNS_DIR = ROOT / "runs"
 TEMPLATES_DIR = ROOT / "src" / "app" / "templates"
 
+# make src importable
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
@@ -56,6 +59,13 @@ def _read_preview(run_dir: pathlib.Path, k: int | None = None) -> list[dict]:
                 break
     return out
 
+def _clamp(val, lo, hi, default):
+    try:
+        x = float(val)
+    except Exception:
+        return default
+    return max(lo, min(hi, x))
+
 def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int | None = None) -> str:
     try:
         from scripts.mk_report import make_html as _fancy
@@ -65,6 +75,13 @@ def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int | None = None
     def esc(x):
         import html
         return html.escape("" if x is None else str(x))
+    meta = {}
+    mp = run_dir / "run_meta.json"
+    if mp.exists():
+        try:
+            meta = json.load(open(mp, "r", encoding="utf-8"))
+        except Exception:
+            meta = {}
     rows = []
     for i, rec in enumerate(_read_preview(run_dir, k=max_samples), start=1):
         prompt = esc(rec.get("prompt", ""))
@@ -80,9 +97,20 @@ def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int | None = None
  table{{border-collapse:collapse;width:100%}}
  th,td{{border:1px solid #ddd;padding:6px;vertical-align:top}}
  th{{background:#f6f6f6}}
+ .box{{border:1px solid #ddd;padding:10px;border-radius:8px;margin:10px 0;background:#fafafa}}
 </style>
 <title>Run Report</title></head><body>
 <h2>Run Report</h2>
+<div class='box'>
+  <h3>Run Settings</h3>
+  <ul>
+    <li><b>Target model:</b> {esc(meta.get('target_model_name',''))}</li>
+    <li><b>Temperature:</b> {esc(meta.get('temperature',''))}</li>
+    <li><b>Max new tokens:</b> {esc(meta.get('max_new_tokens',''))}</li>
+    <li><b>Seed source:</b> {esc(meta.get('seed_source',''))}</li>
+    <li><b>Prepared count:</b> {esc(meta.get('prepared_count',''))}</li>
+  </ul>
+</div>
 <table><tr><th>#</th><th>Prompt</th><th>Output</th><th>Reward</th></tr>
 {''.join(rows)}
 </table></body></html>"""
@@ -93,25 +121,17 @@ def home():
 
 @app.post("/start")
 def start():
-    """
-    Start a run safely.
-    Defaults:
-      - seed_source: "local"
-      - if local and seed_count missing/0 → use ALL rows in local file
-      - write seeds.jsonl for the engine
-      - override cfg.run.seeds_per_iter to the prepared count so ALL are processed
-    """
     if _current["thread"] and _current["thread"].is_alive():
         return jsonify({"ok": False, "error": "run_in_progress"}), 400
 
+    # ABSOLUTE PATH HERE:
     try:
-        cfg = load_config("configs/baseline.yaml")
+        cfg = load_config(str(CFG_PATH))
     except Exception as e:
         return jsonify({"ok": False, "error": f"config_load_failed: {e}"}), 500
 
     payload = request.get_json(silent=True) or {}
 
-    # choose local file automatically: seeds.json (if present) else seeds.jsonl
     default_local = cfg.paths.seeds_path
     candidates = [default_local, "src/storage/seeds.json", "src/storage/seeds.jsonl"]
     _, chosen_local = read_local_auto(candidates)
@@ -120,36 +140,31 @@ def start():
     seed_source = payload.get("seed_source", "local")
     raw_count   = payload.get("seed_count", None)
     seed_count  = None if (raw_count is None or (isinstance(raw_count, int) and raw_count <= 0)) else int(raw_count)
-
-    # if local + no count → use ALL rows
     if seed_source == "local" and (seed_count is None):
         if local_src.endswith(".jsonl"):
             seed_count = len(read_local_jsonl(local_src))
         else:
             seed_count = len(read_local_json(local_src))
 
-    hf_dataset_id = payload.get("hf_dataset_id", "LibrAI/do-not-answer")
-    hf_split      = payload.get("hf_split", "train")
-    hf_text_col   = payload.get("hf_text_column", "question")
+    temperature = _clamp(payload.get("temperature", cfg.run.temperature), 0.0, 1.0, cfg.run.temperature)
+    max_tokens  = int(_clamp(payload.get("max_new_tokens", cfg.run.max_new_tokens), 1, 512, cfg.run.max_new_tokens))
+
     shuffle_seed  = int(payload.get("seed", _now_seed()))
-
     seeds_out = cfg.paths.seeds_path
-
     try:
         info = prepare_seeds(
             source=seed_source,
             out_path=seeds_out,
             local_path=local_src,
-            hf_dataset_id=hf_dataset_id,
-            hf_split=hf_split,
-            hf_text_column=hf_text_col,
+            hf_dataset_id=payload.get("hf_dataset_id", "LibrAI/do-not-answer"),
+            hf_split=payload.get("hf_split", "train"),
+            hf_text_column=payload.get("hf_text_column", "question"),
             count=seed_count,
             seed=shuffle_seed,
         )
     except Exception as e:
         return jsonify({"ok": False, "error": f"seed_prep_failed: {e}"}), 500
 
-    # ensure ALL prepared items are processed in this run
     try:
         kept = int(info.get("kept", 0))
         if kept > 0:
@@ -158,8 +173,22 @@ def start():
     except Exception:
         pass
 
+    cfg.run.temperature = temperature
+    cfg.run.max_new_tokens = max_tokens
+
     engine = IterationEngine(cfg)
     _current["engine"] = engine
+    try:
+        meta = {
+            "target_model_name": cfg.models.target_model_name,
+            "temperature": cfg.run.temperature,
+            "max_new_tokens": cfg.run.max_new_tokens,
+            "seed_source": seed_source,
+            "prepared_count": kept if 'kept' in locals() else None,
+        }
+        write_json(str(engine.run_dir / "run_meta.json"), meta)
+    except Exception:
+        pass
 
     def work():
         try:
@@ -194,6 +223,7 @@ def result():
             "metrics":       f"runs/{rid}/metrics.json",
             "interactions":  f"runs/{rid}/interactions.jsonl",
             "status":        f"runs/{rid}/status.json",
+            "run_meta":      f"runs/{rid}/run_meta.json",
         }
     })
 
@@ -202,10 +232,17 @@ def report():
     rid = request.args.get("run_id")
     resolved = _resolve_run(rid)
     if not resolved:
-        return render_template("report.html", found=False, run_id=None, metrics={}, samples=[])
+        return render_template("report.html", found=False, run_id=None, settings={}, samples=[])
     run_id, run_dir = resolved
-    samples = _read_preview(run_dir, k=None)  # ALL
-    return render_template("report.html", found=True, run_id=f"runs/{run_id}", metrics={}, samples=samples)
+    settings = {}
+    rp = run_dir / "run_meta.json"
+    if rp.exists():
+        try:
+            settings = json.load(open(rp, "r", encoding="utf-8"))
+        except Exception:
+            settings = {}
+    samples = _read_preview(run_dir, k=None)
+    return render_template("report.html", found=True, run_id=f"runs/{run_id}", settings=settings, samples=samples)
 
 @app.get("/runs/<path:subpath>")
 def serve_runs(subpath: str):
@@ -222,19 +259,13 @@ def export_report():
         rid, run_dir = _resolve_run(payload.get("run_id")) or (None, None)
         if not run_dir:
             return jsonify({"ok": False, "error": "no_runs"}), 400
-
-        html_out = _make_report_html_safe(run_dir, max_samples=None)  # ALL
+        html_out = _make_report_html_safe(run_dir, max_samples=None)
         report_path = run_dir / "report.html"
-        index_path  = run_dir / "index.html"   # also write per-run index.html
+        index_path  = run_dir / "index.html"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(html_out, encoding="utf-8")
         index_path.write_text(html_out, encoding="utf-8")
-
-        return jsonify({
-            "ok": True,
-            "report_path": f"runs/{rid}/report.html",
-            "report_dl":   f"dl/{rid}/report.html"
-        }), 200
+        return jsonify({"ok": True, "report_path": f"runs/{rid}/report.html", "report_dl": f"dl/{rid}/report.html"}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -247,14 +278,12 @@ def zip_run():
             return jsonify({"ok": False, "error": "no_runs"}), 400
         if not run_dir.exists() or not run_dir.is_dir():
             return jsonify({"ok": False, "error": f"missing run dir: {run_dir}"}), 400
-
         zip_abs = RUNS_DIR / f"{rid}.zip"
         with ZipFile(zip_abs, "w", ZIP_DEFLATED) as zf:
             for path in glob.glob(str(run_dir / "**"), recursive=True):
                 if os.path.isfile(path):
                     arcname = os.path.relpath(path, str(RUNS_DIR))
                     zf.write(path, arcname=arcname)
-
         return jsonify({"ok": True, "zip_path": f"runs/{rid}.zip", "zip_dl": f"dl/{rid}.zip"}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500

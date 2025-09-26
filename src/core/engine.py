@@ -1,69 +1,76 @@
+# src/core/engine.py
 from __future__ import annotations
+import json, pathlib
 from typing import List, Dict
-import time
-from src.core.utils import ensure_dir, now_ts, append_jsonl, write_json
-from src.storage.data import load_seeds
-from src.models.target import TargetModel
-from src.metrics.reward import score_response
+from .config import AppConfig
+from .utils import write_json, ensure_dir, ts_run_id
+from .hf_textgen import TextGenerator
 
 class IterationEngine:
-    def __init__(self, cfg):
+    def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self.run_id = now_ts()
-        self.run_dir = f"{cfg.paths.runs_dir}/{self.run_id}"
-        ensure_dir(self.run_dir)
-        self.status = {"phase": "idle", "iter": 0, "percent": 0}
+        self.run_id  = ts_run_id()
+        self.run_dir = pathlib.Path(self.cfg.paths.runs_dir) / self.run_id
+        ensure_dir(str(self.run_dir))
 
-    def _set_status(self, phase: str, iter_n: int, percent: int):
-        self.status = {"phase": phase, "iter": iter_n, "percent": percent}
-        write_json(f"{self.run_dir}/status.json", self.status)
-
-    def _save_config(self):
-        write_json(
-            f"{self.run_dir}/config_resolved.json",
-            {
-                "run": self.cfg.run.__dict__,
-                "models": self.cfg.models.__dict__,
-                "paths": self.cfg.paths.__dict__
+        # Save resolved config
+        write_json(str(self.run_dir / "config_resolved.json"), {
+            "run": {
+                "seeds_per_iter": self.cfg.run.seeds_per_iter,
+                "iterations": self.cfg.run.iterations,
+                "max_new_tokens": self.cfg.run.max_new_tokens,
+                "temperature": self.cfg.run.temperature,
             },
-        )
+            "models": {"target_model_name": self.cfg.models.target_model_name},
+            "paths":  {"runs_dir": self.cfg.paths.runs_dir, "seeds_path": self.cfg.paths.seeds_path}
+        })
 
-    def run(self) -> str:
-        self._save_config()
+        self.status = {"phase": "idle", "iter": 0, "percent": 0}
+        write_json(str(self.run_dir / "status.json"), self.status)
 
-        # Load seeds
-        self._set_status("loading_seeds", 0, 5)
-        seeds = load_seeds(self.cfg.paths.seeds_path, limit=self.cfg.run.seeds_per_iter)
+        # Text generator with 4-bit + fallbacks
+        self.textgen = TextGenerator(self.cfg.models.target_model_name, load_4bit=True)
 
-        # Init target model
-        self._set_status("loading_model", 0, 10)
-        model = TargetModel(
-            self.cfg.models.target_model_name,
-            max_new_tokens=self.cfg.run.max_new_tokens,
-            temperature=self.cfg.run.temperature
-        )
+    def _set_status(self, phase: str, it: int, pct: int):
+        self.status.update({"phase": phase, "iter": it, "percent": pct})
+        write_json(str(self.run_dir / "status.json"), self.status)
 
-        # Week 1: single iteration
-        interactions: List[Dict] = []
-        n = max(1, len(seeds))
-        for i, item in enumerate(seeds, start=1):
-            self._set_status("generating", 1, int(10 + 80 * (i / n)))
-            prompt = item["text"]
-            output = model.generate(prompt)
-            reward = score_response(output)
-            interactions.append({
-                "seed_id": item.get("id", i),
-                "prompt": prompt,
-                "output": output,
-                "reward": reward
-            })
-            time.sleep(0.02)  # tiny pause for smoother progress updates
+    def _read_seeds(self) -> List[Dict]:
+        seeds_path = pathlib.Path(self.cfg.paths.seeds_path)
+        out: List[Dict] = []
+        if not seeds_path.exists():
+            return out
+        with open(seeds_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+                        out.append(obj)
+                except Exception:
+                    pass
+        return out
 
-        # Save interactions + basic metrics
-        append_jsonl(f"{self.run_dir}/interactions.jsonl", interactions)
-        asr = sum(1 for it in interactions if it["reward"]["level"] >= 2) / len(interactions)
-        metrics = {"asr": asr, "count": len(interactions)}
-        write_json(f"{self.run_dir}/metrics.json", metrics)
+    def run(self):
+        self._set_status("running", 0, 0)
+        seeds = self._read_seeds()
+        total = min(len(seeds), int(self.cfg.run.seeds_per_iter))
+        if total == 0:
+            write_json(str(self.run_dir / "metrics.json"), {"count": 0})
+            self._set_status("done", 0, 100)
+            return
 
-        self._set_status("done", 1, 100)
-        return self.run_id
+        interactions_path = self.run_dir / "interactions.jsonl"
+        for i in range(total):
+            prompt = seeds[i].get("text", "")
+            output = self.textgen.generate(prompt, max_new_tokens=int(self.cfg.run.max_new_tokens), temperature=float(self.cfg.run.temperature))
+            rec = {"index": i, "prompt": prompt, "output": output, "reward": {"score": "", "level": ""}}
+            with open(interactions_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            pct = int((i + 1) * 100 / total)
+            self._set_status("running", i + 1, pct)
+
+        write_json(str(self.run_dir / "metrics.json"), {"count": total})
+        self._set_status("done", total, 100)

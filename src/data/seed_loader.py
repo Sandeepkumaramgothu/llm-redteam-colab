@@ -3,6 +3,7 @@ import os, json, random
 from typing import List, Dict, Optional, Tuple, Any
 
 def _normalize_rows(raw: List[Any]) -> List[Dict]:
+    """Turn a list of dicts/strings into [{"id":..., "text":...}]."""
     out: List[Dict] = []
     for i, item in enumerate(raw):
         if isinstance(item, dict):
@@ -15,6 +16,7 @@ def _normalize_rows(raw: List[Any]) -> List[Dict]:
     return out
 
 def read_local_jsonl(jsonl_path: str) -> List[Dict]:
+    """Read one-JSON-object-per-line format."""
     rows: List[Dict] = []
     if not os.path.exists(jsonl_path):
         return rows
@@ -35,6 +37,7 @@ def read_local_jsonl(jsonl_path: str) -> List[Dict]:
     return rows
 
 def read_local_json(json_path: str) -> List[Dict]:
+    """Read a .json file that contains a list (or a dict whose value is a list)."""
     if not os.path.exists(json_path):
         return []
     try:
@@ -51,6 +54,11 @@ def read_local_json(json_path: str) -> List[Dict]:
     return []
 
 def read_local_auto(candidates: List[str]) -> Tuple[List[Dict], Optional[str]]:
+    """
+    Try multiple paths. First existing one wins.
+    Supports both seeds.jsonl and seeds.json.
+    Returns (rows, chosen_path_or_None)
+    """
     for p in candidates:
         if p.endswith(".jsonl"):
             rows = read_local_jsonl(p)
@@ -60,11 +68,12 @@ def read_local_auto(candidates: List[str]) -> Tuple[List[Dict], Optional[str]]:
             continue
         if rows:
             return rows, p
-        if os.path.exists(p):
+        if os.path.exists(p):    # file exists but empty → still say we chose it
             return [], p
     return [], None
 
 def _rng(seed: Optional[int]) -> random.Random:
+    """If seed=None → super-random. If seed is a number → reproducible."""
     return random.SystemRandom() if seed is None else random.Random(int(seed))
 
 def load_hf_dna_prompts(
@@ -74,6 +83,7 @@ def load_hf_dna_prompts(
     max_items: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> List[Dict]:
+    """Pull from Hugging Face DNA dataset; sample max_items rows."""
     try:
         from datasets import load_dataset
     except Exception as e:
@@ -91,11 +101,12 @@ def load_hf_dna_prompts(
 
     if isinstance(max_items, int) and 0 < max_items < len(pool):
         rng = _rng(seed)
-        idxs = rng.sample(range(len(pool)), k=max_items)
+        idxs = rng.sample(range(len(pool)), k=max_items)  # pick k unique rows
         return [pool[i] for i in idxs]
     return pool if max_items is None else pool[:max_items]
 
 def write_jsonl(rows: List[Dict], out_path: str):
+    """Save rows into a .jsonl file so the engine can read them."""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         for r in rows:
@@ -111,11 +122,16 @@ def prepare_seeds(
     count: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> Dict:
+    """
+    Create seeds.jsonl for the engine with exactly `count` items when possible.
+    - If source='local' and count is None/0 → use ALL local rows.
+    - If source='dna' and count is set → sample that many from DNA.
+    """
     if source == "local":
         rows = read_local_jsonl(local_path) if local_path.endswith(".jsonl") else read_local_json(local_path)
         total = len(rows)
         if count is None or int(count) <= 0:
-            kept = rows
+            kept = rows                          # ALL local rows
         else:
             c = int(count)
             if total > c:
