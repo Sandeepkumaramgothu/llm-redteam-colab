@@ -4,8 +4,7 @@ import os, sys, json, glob, threading, time, pathlib
 from zipfile import ZipFile, ZIP_DEFLATED
 from flask import Flask, jsonify, request, render_template, send_from_directory
 
-# Absolute paths
-ROOT = pathlib.Path(__file__).resolve().parents[2]   # .../redteam_app
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 RUNS_DIR = ROOT / "runs"
 TEMPLATES_DIR = ROOT / "src" / "app" / "templates"
 
@@ -15,15 +14,12 @@ if str(ROOT) not in sys.path:
 from src.core.config import load_config
 from src.core.engine import IterationEngine
 from src.core.utils import write_json
-from src.data.seed_loader import prepare_seeds
+from src.data.seed_loader import prepare_seeds, read_local_auto, read_local_json, read_local_jsonl
 
 app = Flask(__name__, template_folder=str(TEMPLATES_DIR))
 _current = {"engine": None, "thread": None}
 
-# ------------- helpers -------------
-
 def _now_seed() -> int:
-    """Fresh random seed each run."""
     return time.time_ns() % 1_000_000
 
 def _latest_run_id() -> str | None:
@@ -31,7 +27,7 @@ def _latest_run_id() -> str | None:
     dirs = sorted([p.name for p in RUNS_DIR.glob("*") if p.is_dir()])
     return dirs[-1] if dirs else None
 
-def _resolve_run(run_identifier: str | None) -> tuple[str, pathlib.Path] | None:
+def _resolve_run(run_identifier: str | None):
     if not run_identifier:
         rid = _latest_run_id()
         if not rid:
@@ -42,12 +38,8 @@ def _resolve_run(run_identifier: str | None) -> tuple[str, pathlib.Path] | None:
         rid = rid.split("/", 1)[1]
     return rid, RUNS_DIR / rid
 
-def _read_samples_for_preview(run_dir: pathlib.Path, k: int | None = None) -> list[dict]:
-    """
-    Read up to k interaction rows for the preview page.
-    k=None => read ALL rows safely.
-    """
-    out: list[dict] = []
+def _read_preview(run_dir: pathlib.Path, k: int | None = None) -> list[dict]:
+    out = []
     ip = run_dir / "interactions.jsonl"
     if not ip.exists():
         return out
@@ -65,43 +57,22 @@ def _read_samples_for_preview(run_dir: pathlib.Path, k: int | None = None) -> li
     return out
 
 def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int | None = None) -> str:
-    """
-    Try fancy exporter; if it fails, build a simple HTML. max_samples=None => ALL.
-    """
     try:
         from scripts.mk_report import make_html as _fancy
-        # Pass a very large number if None (so exporter shows all)
         return _fancy(str(run_dir), max_samples=(10**9 if max_samples is None else max_samples))
     except Exception:
         pass
-
     def esc(x):
         import html
         return html.escape("" if x is None else str(x))
-
-    metrics = {}
-    mp = run_dir / "metrics.json"
-    if mp.exists():
-        try:
-            metrics = json.load(open(mp, "r", encoding="utf-8"))
-        except Exception:
-            metrics = {}
-    count = metrics.get("count", "")
-    asr = metrics.get("asr", "")
-
     rows = []
-    # Read ALL if max_samples is None
-    for i, rec in enumerate(_read_samples_for_preview(run_dir, k=max_samples), start=1):
+    for i, rec in enumerate(_read_preview(run_dir, k=max_samples), start=1):
         prompt = esc(rec.get("prompt", ""))
-        out = esc(rec.get("output", ""))[:200000]  # big cap to avoid runaway HTML
+        out = esc(rec.get("output", ""))[:200000]
         rw = rec.get("reward") or {}
         score = esc(rw.get("score", ""))
         level = esc(rw.get("level", ""))
-        rows.append(
-            f"<tr><td>{i}</td><td class='mono'>{prompt}</td>"
-            f"<td class='mono'>{out}</td><td>{score}/{level}</td></tr>"
-        )
-
+        rows.append(f"<tr><td>{i}</td><td class='mono'>{prompt}</td><td class='mono'>{out}</td><td>{score}/{level}</td></tr>")
     return f"""<!doctype html><html><head><meta charset='utf-8'/>
 <style>
  body{{font-family:system-ui,Arial;margin:2rem}}
@@ -112,13 +83,9 @@ def _make_report_html_safe(run_dir: pathlib.Path, max_samples: int | None = None
 </style>
 <title>Run Report</title></head><body>
 <h2>Run Report</h2>
-<p><b>Run:</b> {esc(str(run_dir))}</p>
-<ul><li><b>count</b>: {esc(count)}</li><li><b>asr</b>: {esc(asr)}</li></ul>
 <table><tr><th>#</th><th>Prompt</th><th>Output</th><th>Reward</th></tr>
 {''.join(rows)}
 </table></body></html>"""
-
-# ------------- routes -------------
 
 @app.get("/")
 def home():
@@ -127,10 +94,12 @@ def home():
 @app.post("/start")
 def start():
     """
-    Start a run:
-    - Prepare seeds.jsonl (dna/local)
-    - Run the engine in a background thread
-    Defaults: PREPARE 100 seeds from DNA and process 100 seeds this run.
+    Start a run safely.
+    Defaults:
+      - seed_source: "local"
+      - if local and seed_count missing/0 → use ALL rows in local file
+      - write seeds.jsonl for the engine
+      - override cfg.run.seeds_per_iter to the prepared count so ALL are processed
     """
     if _current["thread"] and _current["thread"].is_alive():
         return jsonify({"ok": False, "error": "run_in_progress"}), 400
@@ -141,20 +110,36 @@ def start():
         return jsonify({"ok": False, "error": f"config_load_failed: {e}"}), 500
 
     payload = request.get_json(silent=True) or {}
-    seed_source   = payload.get("seed_source", "dna")
-    seed_count    = int(payload.get("seed_count", 100))   # ⬅️ DEFAULT PREPARED COUNT = 100
+
+    # choose local file automatically: seeds.json (if present) else seeds.jsonl
+    default_local = cfg.paths.seeds_path
+    candidates = [default_local, "src/storage/seeds.json", "src/storage/seeds.jsonl"]
+    _, chosen_local = read_local_auto(candidates)
+    local_src = chosen_local or default_local
+
+    seed_source = payload.get("seed_source", "local")
+    raw_count   = payload.get("seed_count", None)
+    seed_count  = None if (raw_count is None or (isinstance(raw_count, int) and raw_count <= 0)) else int(raw_count)
+
+    # if local + no count → use ALL rows
+    if seed_source == "local" and (seed_count is None):
+        if local_src.endswith(".jsonl"):
+            seed_count = len(read_local_jsonl(local_src))
+        else:
+            seed_count = len(read_local_json(local_src))
+
     hf_dataset_id = payload.get("hf_dataset_id", "LibrAI/do-not-answer")
     hf_split      = payload.get("hf_split", "train")
     hf_text_col   = payload.get("hf_text_column", "question")
-    shuffle_seed  = int(payload.get("seed", time.time_ns() % 1_000_000))
+    shuffle_seed  = int(payload.get("seed", _now_seed()))
 
-    seeds_out = cfg.paths.seeds_path  # "src/storage/seeds.jsonl"
+    seeds_out = cfg.paths.seeds_path
 
     try:
         info = prepare_seeds(
             source=seed_source,
             out_path=seeds_out,
-            local_path=seeds_out,
+            local_path=local_src,
             hf_dataset_id=hf_dataset_id,
             hf_split=hf_split,
             hf_text_column=hf_text_col,
@@ -164,6 +149,15 @@ def start():
     except Exception as e:
         return jsonify({"ok": False, "error": f"seed_prep_failed: {e}"}), 500
 
+    # ensure ALL prepared items are processed in this run
+    try:
+        kept = int(info.get("kept", 0))
+        if kept > 0:
+            cfg.run.seeds_per_iter = kept
+            cfg.run.iterations = 1
+    except Exception:
+        pass
+
     engine = IterationEngine(cfg)
     _current["engine"] = engine
 
@@ -172,9 +166,7 @@ def start():
             engine.run()
         except Exception as e:
             write_json(str(engine.run_dir / "error.json"), {"error": str(e)})
-            engine._set_status("error",
-                               engine.status.get("iter", 0),
-                               engine.status.get("percent", 0))
+            engine._set_status("error", engine.status.get("iter", 0), engine.status.get("percent", 0))
 
     t = threading.Thread(target=work, daemon=True)
     _current["thread"] = t
@@ -207,23 +199,13 @@ def result():
 
 @app.get("/report")
 def report():
-    # Preview page: SHOW ALL interactions for latest (or chosen) run
     rid = request.args.get("run_id")
     resolved = _resolve_run(rid)
     if not resolved:
         return render_template("report.html", found=False, run_id=None, metrics={}, samples=[])
     run_id, run_dir = resolved
-
-    metrics = {}
-    mp = run_dir / "metrics.json"
-    if mp.exists():
-        try:
-            metrics = json.load(open(mp, "r", encoding="utf-8"))
-        except Exception:
-            metrics = {}
-
-    samples = _read_samples_for_preview(run_dir, k=None)  # ⬅️ ALL for preview
-    return render_template("report.html", found=True, run_id=f"runs/{run_id}", metrics=metrics, samples=samples)
+    samples = _read_preview(run_dir, k=None)  # ALL
+    return render_template("report.html", found=True, run_id=f"runs/{run_id}", metrics={}, samples=samples)
 
 @app.get("/runs/<path:subpath>")
 def serve_runs(subpath: str):
@@ -241,11 +223,12 @@ def export_report():
         if not run_dir:
             return jsonify({"ok": False, "error": "no_runs"}), 400
 
-        html_out = _make_report_html_safe(run_dir, max_samples=None)  # ⬅️ ALL in exported report
-        out_path = run_dir / "report.html"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(html_out)
+        html_out = _make_report_html_safe(run_dir, max_samples=None)  # ALL
+        report_path = run_dir / "report.html"
+        index_path  = run_dir / "index.html"   # also write per-run index.html
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(html_out, encoding="utf-8")
+        index_path.write_text(html_out, encoding="utf-8")
 
         return jsonify({
             "ok": True,
@@ -272,11 +255,7 @@ def zip_run():
                     arcname = os.path.relpath(path, str(RUNS_DIR))
                     zf.write(path, arcname=arcname)
 
-        return jsonify({
-            "ok": True,
-            "zip_path": f"runs/{rid}.zip",
-            "zip_dl":   f"dl/{rid}.zip"
-        }), 200
+        return jsonify({"ok": True, "zip_path": f"runs/{rid}.zip", "zip_dl": f"dl/{rid}.zip"}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

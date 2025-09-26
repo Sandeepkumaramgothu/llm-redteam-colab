@@ -1,39 +1,33 @@
-from __future__ import annotations
+# src/app/serve_process.py
+# Colab-friendly server launcher that keeps Flask in the background.
+import threading, time
 from typing import Optional
-import multiprocessing as mp
-from src.app.server import run_app
+from .server import run_app
 
-# Use a SPAWN context so CUDA initializes cleanly inside the child process
-_ctx = mp.get_context("spawn")
+PORT: Optional[int] = None
+THREAD: Optional[threading.Thread] = None
 
-_server_proc: Optional[mp.Process] = None
-_server_port: int = 8000
+def start_server(port: int = 8128):
+    global PORT, THREAD
+    PORT = port
+    if THREAD and THREAD.is_alive():
+        return {"ok": False, "msg": "already running", "port": PORT}
+    THREAD = threading.Thread(target=lambda: run_app(PORT), daemon=True)
+    THREAD.start()
+    time.sleep(0.6)  # give it a moment to boot
+    return {"ok": True, "port": PORT}
 
-def start_server(port: int = 8000) -> bool:
-    """
-    Start Flask in a separate PROCESS (spawned) so CUDA works.
-    Returns True if started, False if already running.
-    """
-    global _server_proc, _server_port
-    if _server_proc is not None and _server_proc.is_alive():
-        return False
-    _server_port = port
-    p = _ctx.Process(target=run_app, kwargs={"port": port}, daemon=True)
-    p.start()
-    _server_proc = p
-    return True
+def stop_server():
+    # use the shutdown route to stop gracefully; ignore errors
+    import requests
+    if PORT is None:
+        return {"ok": False, "msg": "not running"}
+    try:
+        requests.post(f"http://127.0.0.1:{PORT}/shutdown", timeout=1.0)
+        time.sleep(0.5)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-def stop_server() -> bool:
-    """
-    Stop the Flask process if it is running.
-    """
-    global _server_proc
-    if _server_proc is not None and _server_proc.is_alive():
-        _server_proc.terminate()
-        _server_proc.join(timeout=2)
-        _server_proc = None
-        return True
-    return False
-
-def server_port() -> int:
-    return _server_port
+def server_port():
+    return PORT or 8128

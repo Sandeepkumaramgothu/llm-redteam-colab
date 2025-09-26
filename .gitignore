@@ -1,24 +1,18 @@
-# Python build junk
+# python
 __pycache__/
 .ipynb_checkpoints/
 *.pyc
-*.pyo
 
-# Local env/secrets
-.env
-*.secret
-*.token
-
-# Project artifacts we do NOT want in git
-runs/
-reports/
-*.log
-
-# Big model weights (handled with LFS if ever needed)
-*.bin
-*.safetensors
-*.pt
-
-# OS noise
+# OS
 .DS_Store
-Thumbs.db
+
+# notebooks' temp files
+*.swp
+*.swo
+
+# big artifacts
+runs/
+*.zip
+
+# misc
+.env

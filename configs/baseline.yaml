@@ -1,8 +1,8 @@
 run:
-  seeds_per_iter: 100       # ⬅️ process 100 prompts each run
-  iterations: 1             # keep 1 iteration while testing
-  max_new_tokens: 64        # generation length limit
-  temperature: 0.7          # randomness (0 strict, 1 creative)
+  seeds_per_iter: 100       # server will override to the prepared count so ALL are processed
+  iterations: 1
+  max_new_tokens: 64
+  temperature: 0.7
 
 models:
   target_model_name: "google/flan-t5-small"
