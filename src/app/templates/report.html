@@ -10,7 +10,7 @@
   <title>Run Preview</title>
   <style>
     body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
-    .box { border:1px solid #ddd; padding:10px; border-radius:8px; background:#fafafa; }
+    .box { border:1px solid #ddd; padding:10px; border-radius:8px; background:#fafafa; margin-bottom: 16px; }
     .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
     table { border-collapse: collapse; width: 100%; }
     th,td { border:1px solid #ddd; padding:6px; vertical-align: top; }
@@ -19,28 +19,39 @@
 </head>
 <body>
   <h2>Run Preview</h2>
+
   <div class="box">
     <h3>Run Settings</h3>
     <ul>
       <li><b>run:</b> {{ run_id }}</li>
-      <li><b>target model:</b> {{ settings.get("target_model_name","") }}</li>
+      <li><b>preferred model:</b> {{ settings.get("preferred_model","") }}</li>
+      <li><b>actual model:</b> {{ settings.get("actual_model","") }} {% if settings.get("fallback_used") %}(fallback used){% endif %}</li>
       <li><b>temperature:</b> {{ settings.get("temperature","") }}</li>
       <li><b>max_new_tokens:</b> {{ settings.get("max_new_tokens","") }}</li>
       <li><b>seed source:</b> {{ settings.get("seed_source","") }}</li>
       <li><b>prepared count:</b> {{ settings.get("prepared_count","") }}</li>
     </ul>
   </div>
+
+  <div class="box">
+    <h3>Metrics</h3>
+    <ul>
+      <li><b>items processed:</b> {{ metrics.get("count","") }}</li>
+      <li><b>total new tokens:</b> {{ metrics.get("total_new_tokens","") }}</li>
+      <li><b>generation time (sec, sum):</b> {{ metrics.get("gen_time_sec","") }}</li>
+      <li><b>wall time (sec):</b> {{ metrics.get("wall_time_sec","") }}</li>
+      <li><b>tokens/sec (avg):</b> {{ metrics.get("tokens_per_sec","") }}</li>
+    </ul>
+  </div>
+
   <table>
-    <tr><th>#</th><th>Prompt</th><th>Output</th><th>Reward</th></tr>
+    <tr><th>#</th><th>Prompt</th><th>Output</th><th>Per-item Stats</th></tr>
     {% for rec in samples %}
       <tr>
         <td>{{ loop.index }}</td>
         <td class="mono">{{ rec.get("prompt","") }}</td>
         <td class="mono">{{ rec.get("output","") }}</td>
-        <td class="mono">
-          {% set rw = rec.get("reward") or {} %}
-          score={{ rw.get("score","") }} level={{ rw.get("level","") }}
-        </td>
+        <td class="mono">new_tokens={{ rec.get("new_tokens","") }}, gen_time_sec={{ rec.get("gen_time_sec","") }}</td>
       </tr>
     {% endfor %}
   </table>
