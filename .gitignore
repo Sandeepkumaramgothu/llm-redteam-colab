@@ -1,18 +1,21 @@
-# python
+
+# Python junk
 __pycache__/
-.ipynb_checkpoints/
 *.pyc
+.ipynb_checkpoints/
 
-# OS
-.DS_Store
-
-# notebooks' temp files
-*.swp
-*.swo
-
-# big artifacts
-runs/
+# Colab / temp
 *.zip
+*.log
 
-# misc
-.env
+# Artifacts from our app
+runs/
+outputs/
+checkpoints/
+
+# Models & caches
+*.bin
+*.pt
+*.safetensors
+.cache/
+huggingface/
