@@ -1,60 +1,102 @@
-{% if not found %}
-<!doctype html><meta charset="utf-8">
-<h3>No run found yet</h3>
-<p>Click <a href="/">Start</a> to create one.</p>
-{% else %}
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Run Preview</title>
+  <meta charset="utf-8" />
+  <title>Run Report</title>
   <style>
     body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
-    .box { border:1px solid #ddd; padding:10px; border-radius:8px; background:#fafafa; margin-bottom: 16px; }
     .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
     table { border-collapse: collapse; width: 100%; }
-    th,td { border:1px solid #ddd; padding:6px; vertical-align: top; }
-    th { background:#f6f6f6; }
+    th, td { border: 1px solid #ddd; padding: 6px; vertical-align: top; }
+    th { background: #f6f6f6; }
+    .box { border: 1px solid #ddd; padding: 10px; border-radius: 8px; background: #fafafa; margin: 14px 0; }
+    a { color: #1a73e8; text-decoration: none; }
+    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
-  <h2>Run Preview</h2>
+  <p><a href="/">← Back to Home</a></p>
+  {% if not found %}
+    <h2>No runs yet</h2>
+    <p>Click <b>Start</b> on the home page to create a run.</p>
+  {% else %}
+    <h2>Run Report</h2>
 
-  <div class="box">
-    <h3>Run Settings</h3>
-    <ul>
-      <li><b>run:</b> {{ run_id }}</li>
-      <li><b>preferred model:</b> {{ settings.get("preferred_model","") }}</li>
-      <li><b>actual model:</b> {{ settings.get("actual_model","") }} {% if settings.get("fallback_used") %}(fallback used){% endif %}</li>
-      <li><b>temperature:</b> {{ settings.get("temperature","") }}</li>
-      <li><b>max_new_tokens:</b> {{ settings.get("max_new_tokens","") }}</li>
-      <li><b>seed source:</b> {{ settings.get("seed_source","") }}</li>
-      <li><b>prepared count:</b> {{ settings.get("prepared_count","") }}</li>
-    </ul>
-  </div>
+    <div class="box">
+      <h3>Run Settings</h3>
+      <ul>
+        <li><b>Preferred model:</b> {{ settings.preferred_model or "" }}</li>
+        <li><b>Actual model:</b> {{ settings.actual_model or "" }}{% if settings.fallback_used %} (fallback used){% endif %}</li>
+        <li><b>Temperature:</b> {{ settings.temperature }}</li>
+        <li><b>Max new tokens:</b> {{ settings.max_new_tokens }}</li>
+        <li><b>Seed source:</b> {{ settings.seed_source or "" }}</li>
+        <li><b>Prepared count:</b> {{ settings.prepared_count or "" }}</li>
+        <li><b>Run folder:</b> {{ run_id }}</li>
+      </ul>
+    </div>
 
-  <div class="box">
-    <h3>Metrics</h3>
-    <ul>
-      <li><b>items processed:</b> {{ metrics.get("count","") }}</li>
-      <li><b>total new tokens:</b> {{ metrics.get("total_new_tokens","") }}</li>
-      <li><b>generation time (sec, sum):</b> {{ metrics.get("gen_time_sec","") }}</li>
-      <li><b>wall time (sec):</b> {{ metrics.get("wall_time_sec","") }}</li>
-      <li><b>tokens/sec (avg):</b> {{ metrics.get("tokens_per_sec","") }}</li>
-    </ul>
-  </div>
+    <div class="box">
+      <h3>Generation Metrics</h3>
+      <ul>
+        <li><b>Items processed:</b> {{ metrics.count or 0 }}</li>
+        <li><b>Total new tokens:</b> {{ metrics.total_new_tokens or 0 }}</li>
+        <li><b>Generation time (sum):</b> {{ metrics.gen_time_sec or 0 }} s</li>
+        <li><b>Wall time:</b> {{ metrics.wall_time_sec or 0 }} s</li>
+        <li><b>Tokens/sec (avg):</b> {{ metrics.tokens_per_sec or "" }}</li>
+      </ul>
+    </div>
 
-  <table>
-    <tr><th>#</th><th>Prompt</th><th>Output</th><th>Per-item Stats</th></tr>
-    {% for rec in samples %}
+    <div class="box">
+      <h3>Auto Evaluation</h3>
+      {% set A = metrics.auto or {} %}
+      <ul>
+        <li><b>Total items:</b> {{ A.total_items or 0 }}</li>
+        <li><b>Auto violations:</b> {{ A.violations or 0 }}</li>
+        <li><b>Auto violation rate:</b> {{ A.violation_rate or 0.0 }}</li>
+      </ul>
+    </div>
+
+    <div class="box">
+      <h3>Manual Review (labels)</h3>
+      {% set M = metrics.manual or {} %}
+      {% if M and (M.total_labeled is defined) %}
+        <ul>
+          <li><b>Total labeled:</b> {{ M.total_labeled }} / {{ M.total_items or "" }}</li>
+          <li><b>Violations:</b> {{ M.violations or 0 }}</li>
+          <li><b>Violation rate:</b> {{ M.violation_rate or 0.0 }}</li>
+          <li><b>Avg severity:</b> {{ M.avg_severity if M.avg_severity is not none else "" }}</li>
+        </ul>
+        <p class="mono">Tip: Use <a href="/review">Review</a> to add/change labels, then press "Recompute metrics".</p>
+      {% else %}
+        <p class="mono">No manual labels yet. Open <a href="/review">Review</a>, save a label, and click "Recompute metrics".</p>
+      {% endif %}
+    </div>
+
+    <h3>Samples</h3>
+    <table>
       <tr>
-        <td>{{ loop.index }}</td>
-        <td class="mono">{{ rec.get("prompt","") }}</td>
-        <td class="mono">{{ rec.get("output","") }}</td>
-        <td class="mono">new_tokens={{ rec.get("new_tokens","") }}, gen_time_sec={{ rec.get("gen_time_sec","") }}</td>
+        <th>#</th><th>Prompt</th><th>Output</th><th>Auto Eval</th><th>Manual Label</th><th>Per-item</th>
       </tr>
-    {% endfor %}
-  </table>
+      {% for rec in samples %}
+        {% set auto = rec.auto or {} %}
+        {% set man  = rec.label or {} %}
+        <tr>
+          <td>{{ rec.index + 1 }}</td>
+          <td class="mono">{{ rec.prompt }}</td>
+          <td class="mono">{{ rec.output }}</td>
+          <td>
+            {{ auto.auto_label or "" }}
+            {% if auto.hits %} — {{ auto.hits|join(',') }}{% endif %}
+          </td>
+          <td>
+            {{ man.label or "" }}
+            {% if man.severity is not none %} (sev {{ man.severity }}){% endif %}
+            {% if man.notes %} — {{ man.notes }}{% endif %}
+          </td>
+          <td>{{ rec.new_tokens or "" }} tok / {{ rec.gen_time_sec or "" }} s</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
 </body>
 </html>
-{% endif %}

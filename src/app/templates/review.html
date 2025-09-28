@@ -1,0 +1,215 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Review & Label</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+    .row { margin-bottom: 10px; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+    .box { border:1px solid #ddd; padding:10px; border-radius:8px; background:#fafafa; margin-bottom: 14px; }
+    button { padding: 0.5rem 1rem; margin-right: 8px; }
+    select, input[type="number"], textarea { padding: 6px; }
+    textarea { width: 100%; min-height: 90px; }
+    .muted { color: #666; }
+  </style>
+</head>
+<body>
+  <h2>Review Latest Run</h2>
+  <div class="muted"><a href="/">← Back to Home</a> • <a href="#" id="open_report">Open latest report</a></div>
+
+  <div class="row">
+    <button id="prev">Prev</button>
+    <button id="next">Next</button>
+    <span id="pos" class="muted">item 0 / 0</span>
+  </div>
+
+  <div class="box">
+    <h3>Prompt</h3>
+    <div id="prompt" class="mono"></div>
+  </div>
+
+  <div class="box">
+    <h3>Model Output</h3>
+    <div id="output" class="mono"></div>
+    <div id="stats" class="muted"></div>
+  </div>
+
+  <div class="box">
+    <h3>Your Label</h3>
+    <div class="row">
+      <label>Label:
+        <select id="label">
+          <option value="safe">safe</option>
+          <option value="violation">violation</option>
+        </select>
+      </label>
+      <label>Severity (1-5):
+        <input id="severity" type="number" min="1" max="5" step="1" placeholder="(optional)">
+      </label>
+    </div>
+    <div class="row">
+      <label>Notes:</label>
+      <textarea id="notes" placeholder="Write why you chose this label..."></textarea>
+    </div>
+    <div class="row">
+      <button id="save">Save</button>
+      <button id="recompute">Recompute metrics</button>
+      <span id="msg" class="muted"></span>
+    </div>
+  </div>
+
+  <script>
+    // Small helper: build a full URL from a relative one (works with Colab proxy).
+    function toProxy(relPath) {
+      if (!relPath) return window.location.href;
+      if (relPath.startsWith("/")) relPath = relPath.slice(1);
+      return new URL(relPath, window.location.href).href;
+    }
+
+    async function getJSON(url) {
+      const r = await fetch(toProxy(url));
+      const ct = r.headers.get("content-type") || "";
+      const txt = await r.text();
+      if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,160)}`);
+      const data = JSON.parse(txt);
+      if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+      return data;
+    }
+
+    async function postJSON(url, body) {
+      const r = await fetch(toProxy(url), {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify(body||{})
+      });
+      const ct = r.headers.get("content-type") || "";
+      const txt = await r.text();
+      if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,160)}`);
+      const data = JSON.parse(txt);
+      if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+      return data;
+    }
+
+    // We store the current list and position here.
+    let items = [];
+    let pos = 0;
+    let run_id = null;
+
+    // Load the first page of data: we fetch /api/review_data
+    async function loadData(start=0, limit=1) {
+      const d = await getJSON(`api/review_data?start=${start}&limit=${limit}`);
+      run_id = d.run_id;
+      items = d.items || [];
+      pos = 0;   // reset position inside this small page
+      show();
+    }
+
+    // Update the UI based on items[pos].
+    function show() {
+      if (!items.length) {
+        document.getElementById("pos").textContent = "item 0 / 0";
+        document.getElementById("prompt").textContent = "(no data)";
+        document.getElementById("output").textContent = "";
+        document.getElementById("stats").textContent = "";
+        document.getElementById("label").value = "safe";
+        document.getElementById("severity").value = "";
+        document.getElementById("notes").value = "";
+        return;
+      }
+      const rec = items[pos];
+      document.getElementById("pos").textContent = `item ${rec.index+1} / ${dTotal}`;
+      document.getElementById("prompt").textContent = rec.prompt || "";
+      document.getElementById("output").textContent = rec.output || "";
+      document.getElementById("stats").textContent = `(tokens: ${rec.new_tokens ?? "?"}, time: ${rec.gen_time_sec ?? "?"} s)`;
+
+      // If there is an existing label, load it into the form.
+      const L = rec.label || {};
+      document.getElementById("label").value = L.label || "safe";
+      document.getElementById("severity").value = L.severity || "";
+      document.getElementById("notes").value = L.notes || "";
+    }
+
+    // We'll keep track of total items in the run, so we can display "x / total".
+    let dTotal = 0;
+
+    // Prev and Next buttons move inside the small page; if at edge, fetch new page.
+    document.getElementById("prev").onclick = async () => {
+      if (!items.length) return;
+      if (pos > 0) { pos--; show(); return; }
+      // fetch previous item
+      const start = (items[0].index - 1);
+      if (start >= 0) {
+        const d = await getJSON(`api/review_data?start=${start}&limit=1`);
+        items = d.items || [];
+        pos = 0;
+        dTotal = d.total || dTotal;
+        show();
+      }
+    };
+
+    document.getElementById("next").onclick = async () => {
+      if (!items.length) return;
+      if (pos < items.length - 1) { pos++; show(); return; }
+      // fetch next item
+      const nextIndex = (items[items.length-1].index + 1);
+      const d = await getJSON(`api/review_data?start=${nextIndex}&limit=1`);
+      items = d.items || [];
+      pos = 0;
+      dTotal = d.total || dTotal;
+      show();
+    };
+
+    // Save the current form as a label for the current item.
+    document.getElementById("save").onclick = async () => {
+      document.getElementById("msg").textContent = "saving...";
+      try {
+        if (!items.length) throw new Error("No item to save.");
+        const rec = items[pos];
+        const payload = {
+          run_id: run_id,
+          index: rec.index,
+          label: document.getElementById("label").value,
+          severity: (document.getElementById("severity").value || null) * 1,
+          notes: document.getElementById("notes").value || null
+        };
+        await postJSON("api/review_save", payload);
+        document.getElementById("msg").textContent = "saved ✔";
+      } catch (e) {
+        document.getElementById("msg").textContent = "save failed: " + e.message;
+      }
+    };
+
+    // Recompute metrics by asking the server; then open the report.
+    document.getElementById("recompute").onclick = async () => {
+      document.getElementById("msg").textContent = "recomputing...";
+      try {
+        await postJSON("api/recompute_metrics", { run_id });
+        document.getElementById("msg").textContent = "metrics updated ✔";
+      } catch (e) {
+        document.getElementById("msg").textContent = "metrics failed: " + e.message;
+      }
+    };
+
+    // Open latest report with a cache-busting timestamp.
+    document.getElementById("open_report").onclick = (e) => {
+      e.preventDefault();
+      window.location.href = toProxy("report?t=" + Date.now());
+    };
+
+    // First load: we also ask for "total" so we can display x / total.
+    (async () => {
+      try {
+        const info = await getJSON("result");
+        dTotal = (info && info.artifacts) ? null : 0; // fallback
+      } catch (_) {}
+      const d = await getJSON(`api/review_data?start=0&limit=1`);
+      dTotal = d.total || dTotal || 0;
+      run_id = d.run_id || run_id;
+      items = d.items || [];
+      pos = 0;
+      show();
+    })();
+  </script>
+</body>
+</html>
