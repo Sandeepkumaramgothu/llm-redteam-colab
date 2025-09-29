@@ -1,0 +1,309 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Run Browser — filters v1</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 6px; vertical-align: top; }
+    th { background: #f6f6f6; }
+    button { padding: 6px 10px; margin-right: 6px; }
+    input, select { padding: 4px 6px; margin-right: 8px; }
+    .muted { color: #666; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+    .row { margin: 8px 0; }
+    .box { border: 1px solid #ddd; padding: 10px; border-radius: 8px; background: #fafafa; margin: 12px 0; }
+    .right { float: right; }
+  </style>
+</head>
+<body>
+  <p><a href="/">← Back to Home</a></p>
+
+  <h2>Run Browser <span class="muted">(filters v1)</span></h2>
+  <p class="muted">If you don't see filters, you are on an old page — please restart the server (below) and refresh the browser tab.</p>
+
+  <!-- FILTERS UI -->
+  <div class="box">
+    <div class="row">
+      <label>Model contains:
+        <input id="flt-model" type="text" placeholder="e.g. phi, qwen, llama">
+      </label>
+      <label>Run ID contains:
+        <input id="flt-id" type="text" placeholder="e.g. 20250924">
+      </label>
+    </div>
+
+    <div class="row">
+      <label>Since:
+        <input id="flt-since" type="date">
+      </label>
+      <label>Until:
+        <input id="flt-until" type="date">
+      </label>
+      <label>Min Auto rate:
+        <input id="flt-auto-min" type="number" step="0.01" min="0" max="1" placeholder="0.0">
+      </label>
+      <label>Min Manual rate:
+        <input id="flt-manual-min" type="number" step="0.01" min="0" max="1" placeholder="0.0">
+      </label>
+      <label><input id="flt-has-manual" type="checkbox"> Has Manual Labels</label>
+      <label>Sort by:
+        <select id="sort-by">
+          <option value="newest" selected>Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="manual_desc">Manual rate (high→low)</option>
+          <option value="auto_desc">Auto rate (high→low)</option>
+          <option value="count_desc">Item count (high→low)</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="row">
+      <button id="apply">Apply filters</button>
+      <button id="clear">Clear</button>
+      <button id="refresh">🔁 Refresh from server</button>
+      <span id="msg" class="muted right"></span>
+    </div>
+  </div>
+
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>#</th><th>Run ID</th><th>When</th><th>Model</th>
+        <th>Counts</th><th>Auto</th><th>Manual</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"><!-- rows injected by JS --></tbody>
+  </table>
+
+<script>
+  // --- Helper: build a URL that works through Colab's proxy
+  function toProxy(rel) {
+    if (!rel) return window.location.href;
+    if (rel.startsWith("/")) rel = rel.slice(1);
+    return new URL(rel, window.location.href).href;
+  }
+
+  // --- Helpers to GET/POST JSON and throw helpful errors
+  async function getJSON(path) {
+    const r = await fetch(toProxy(path));
+    const ct = r.headers.get("content-type") || "";
+    const txt = await r.text();
+    if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,200)}`);
+    const data = JSON.parse(txt);
+    if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+    return data;
+  }
+  async function postJSON(path, body) {
+    const r = await fetch(toProxy(path), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    });
+    const ct = r.headers.get("content-type") || "";
+    const txt = await r.text();
+    if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,200)}`);
+    const data = JSON.parse(txt);
+    if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+    return data;
+  }
+
+  // --- Global cache of all runs from the server
+  let ALL_RUNS = [];
+
+  // --- Render a set of rows into the table
+  function render(rows) {
+    const tbody = document.getElementById("tbody");
+    tbody.innerHTML = "";
+    rows.forEach((r, i) => {
+      const tr = document.createElement("tr");
+
+      const tdIdx = document.createElement("td");
+      tdIdx.textContent = (i + 1);
+      tr.appendChild(tdIdx);
+
+      const tdId = document.createElement("td");
+      tdId.textContent = r.run_id;
+      tr.appendChild(tdId);
+
+      const tdWhen = document.createElement("td");
+      tdWhen.textContent = r.when || "";
+      tr.appendChild(tdWhen);
+
+      const tdModel = document.createElement("td");
+      tdModel.textContent = r.model || "";
+      tr.appendChild(tdModel);
+
+      const tdCount = document.createElement("td");
+      tdCount.textContent = `items: ${r.count ?? 0}, toks: ${r.total_new_tokens ?? 0}`;
+      tr.appendChild(tdCount);
+
+      const tdAuto = document.createElement("td");
+      const A = r.auto || {};
+      tdAuto.textContent = `viol: ${A.violations ?? 0}, rate: ${A.violation_rate ?? 0}`;
+      tr.appendChild(tdAuto);
+
+      const tdMan = document.createElement("td");
+      const M = r.manual || {};
+      if (M && (M.total_labeled !== undefined)) {
+        tdMan.textContent = `labeled: ${M.total_labeled}/${M.total_items ?? ""}, viol: ${M.violations ?? 0}, rate: ${M.violation_rate ?? 0}`;
+      } else {
+        tdMan.textContent = "(none)";
+      }
+      tr.appendChild(tdMan);
+
+      const tdAct = document.createElement("td");
+      const bReport = document.createElement("button");
+      bReport.textContent = "Open report";
+      bReport.onclick = () => { window.location.href = toProxy(`/report?run_id=${encodeURIComponent(r.run_id)}`); };
+      tdAct.appendChild(bReport);
+
+      const bCSV = document.createElement("button");
+      bCSV.textContent = "Export CSV";
+      bCSV.onclick = async () => {
+        try {
+          setMsg("exporting CSV...");
+          const d = await postJSON("/export_csv", { run_id: r.run_id });
+          setMsg("CSV ready — downloading...");
+          window.location.href = toProxy("/" + d.csv_dl);
+          setTimeout(() => setMsg(""), 1500);
+        } catch (e) { setMsg("CSV export failed: " + e.message); }
+      };
+      tdAct.appendChild(bCSV);
+
+      const bZip = document.createElement("button");
+      bZip.textContent = "Zip run";
+      bZip.onclick = async () => {
+        try {
+          setMsg("zipping...");
+          const d = await postJSON("/zip_run", { run_id: r.run_id });
+          setMsg("ZIP ready — downloading...");
+          window.location.href = toProxy("/" + d.zip_dl);
+          setTimeout(() => setMsg(""), 1500);
+        } catch (e) { setMsg("zip failed: " + e.message); }
+      };
+      tdAct.appendChild(bZip);
+
+      tr.appendChild(tdAct);
+      tbody.appendChild(tr);
+    });
+
+    // Update the status line: loaded vs showing
+    setMsg(`Loaded ${ALL_RUNS.length}, showing ${rows.length}`);
+  }
+
+  function setMsg(t) { document.getElementById("msg").textContent = t; }
+
+  // --- Read filter inputs into an object
+  function readFilters() {
+    const model = document.getElementById("flt-model").value.trim().toLowerCase();
+    const rid   = document.getElementById("flt-id").value.trim().toLowerCase();
+    const since = document.getElementById("flt-since").value;
+    const until = document.getElementById("flt-until").value;
+    const autoMin = parseFloat(document.getElementById("flt-auto-min").value);
+    const manMin  = parseFloat(document.getElementById("flt-manual-min").value);
+    const hasManual = document.getElementById("flt-has-manual").checked;
+    const sortBy = document.getElementById("sort-by").value;
+
+    return {
+      model_substr: model || null,
+      runid_substr: rid || null,
+      since: since || null,
+      until: until || null,
+      min_auto: isNaN(autoMin) ? null : autoMin,
+      min_manual: isNaN(manMin) ? null : manMin,
+      has_manual: !!hasManual,
+      sort_by: sortBy,
+    };
+  }
+
+  // --- Apply filters and sorting
+  function filterAndSort(all, f) {
+    const toTs = (s) => s ? new Date(s + 'T00:00:00').getTime() : null;
+    const sinceTs = toTs(f.since);
+    const untilTs = f.until ? new Date(f.until + 'T23:59:59').getTime() : null;
+
+    let rows = all.filter(r => {
+      if (f.model_substr && !(String(r.model || '').toLowerCase().includes(f.model_substr))) return false;
+      if (f.runid_substr && !(String(r.run_id || '').toLowerCase().includes(f.runid_substr))) return false;
+
+      if (sinceTs || untilTs) {
+        const ts = new Date((r.when || '').replace(' ', 'T')).getTime();
+        if (!isFinite(ts)) return false;
+        if (sinceTs && ts < sinceTs) return false;
+        if (untilTs && ts > untilTs) return false;
+      }
+
+      const autoRate = (r.auto && typeof r.auto.violation_rate === 'number') ? r.auto.violation_rate : 0;
+      const manInfo  = r.manual || {};
+      const manRate  = (typeof manInfo.violation_rate === 'number') ? manInfo.violation_rate : 0;
+
+      if (f.min_auto !== null && autoRate < f.min_auto) return false;
+      if (f.min_manual !== null && manRate < f.min_manual) return false;
+
+      if (f.has_manual) {
+        const has = (manInfo.total_labeled !== undefined) && (manInfo.total_labeled > 0);
+        if (!has) return false;
+      }
+      return true;
+    });
+
+    rows.sort((a, b) => {
+      const tsA = new Date((a.when || '').replace(' ', 'T')).getTime();
+      const tsB = new Date((b.when || '').replace(' ', 'T')).getTime();
+      const autoA = (a.auto && typeof a.auto.violation_rate === 'number') ? a.auto.violation_rate : 0;
+      const autoB = (b.auto && typeof b.auto.violation_rate === 'number') ? b.auto.violation_rate : 0;
+      const manA  = (a.manual && typeof a.manual.violation_rate === 'number') ? a.manual.violation_rate : 0;
+      const manB  = (b.manual && typeof b.manual.violation_rate === 'number') ? b.manual.violation_rate : 0;
+      const cntA = (typeof a.count === 'number') ? a.count : -1;
+      const cntB = (typeof b.count === 'number') ? b.count : -1;
+
+      switch (f.sort_by) {
+        case 'oldest':      return (tsA - tsB);
+        case 'manual_desc': return (manB - manA) || (tsB - tsA);
+        case 'auto_desc':   return (autoB - autoA) || (tsB - tsA);
+        case 'count_desc':  return (cntB - cntA) || (tsB - tsA);
+        case 'newest':
+        default:            return (tsB - tsA);
+      }
+    });
+
+    return rows;
+  }
+
+  // --- Load from server and render
+  async function loadRuns() {
+    setMsg("loading runs...");
+    try {
+      const d = await getJSON("/api/runs");
+      ALL_RUNS = d.runs || [];
+      // After loading, immediately apply any filters currently set:
+      render(filterAndSort(ALL_RUNS, readFilters()));
+    } catch (e) {
+      setMsg("load failed: " + e.message);
+      ALL_RUNS = [];
+      render([]);
+    }
+  }
+
+  // --- Wire up buttons
+  document.getElementById("apply").onclick = () => render(filterAndSort(ALL_RUNS, readFilters()));
+  document.getElementById("clear").onclick = () => {
+    document.getElementById("flt-model").value = "";
+    document.getElementById("flt-id").value = "";
+    document.getElementById("flt-since").value = "";
+    document.getElementById("flt-until").value = "";
+    document.getElementById("flt-auto-min").value = "";
+    document.getElementById("flt-manual-min").value = "";
+    document.getElementById("flt-has-manual").checked = false;
+    document.getElementById("sort-by").value = "newest";
+    render(filterAndSort(ALL_RUNS, readFilters()));
+  };
+  document.getElementById("refresh").onclick = loadRuns;
+
+  // --- Initial load on page open
+  (async () => { await loadRuns(); })();
+</script>
+</body>
+</html>

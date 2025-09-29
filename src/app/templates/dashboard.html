@@ -1,0 +1,266 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Metrics Dashboard</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+    .muted { color: #666; }
+    .box { border: 1px solid #ddd; padding: 12px; border-radius: 8px; background: #fafafa; margin: 12px 0; }
+    .row { margin: 8px 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 6px; vertical-align: top; }
+    th { background: #f6f6f6; }
+    button { padding: 6px 10px; margin-right: 6px; }
+    .chart-wrap { overflow-x: auto; }
+    svg { background: #fff; border: 1px solid #eee; }
+    .legend { margin-top: 6px; }
+    .swatch { display:inline-block; width:12px; height:12px; margin-right:6px; vertical-align:middle; }
+  </style>
+</head>
+<body>
+  <!-- Top nav back to Home -->
+  <p><a href="/">← Back to Home</a></p>
+  <h2>Metrics Dashboard</h2>
+  <p class="muted">Trends across runs. Use the "Run Browser" for filtering/CSV per run.</p>
+
+  <!-- Actions row -->
+  <div class="row">
+    <button id="refresh">🔁 Refresh</button>
+    <button id="export">Export all runs (summary CSV)</button>
+    <span id="msg" class="muted"></span>
+  </div>
+
+  <!-- Chart box -->
+  <div class="box">
+    <h3>Violation Rate over Time</h3>
+    <div class="chart-wrap">
+      <!-- We draw inside this SVG -->
+      <svg id="chart" width="900" height="260" aria-label="violation rates over time"></svg>
+    </div>
+    <div class="legend">
+      <span class="swatch" style="background:#1a73e8"></span> Auto violation rate
+      &nbsp;&nbsp;
+      <span class="swatch" style="background:#e91e63"></span> Manual violation rate
+      <span class="muted"> (points are runs; hover shows details)</span>
+    </div>
+  </div>
+
+  <!-- Table box -->
+  <div class="box">
+    <h3>Runs Summary</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>Run ID</th><th>When</th><th>Model</th>
+          <th>Items</th><th>Auto viol/rate</th><th>Manual labeled/viol/rate</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"><!-- rows inserted here --></tbody>
+    </table>
+  </div>
+
+<script>
+  // --- Helper: turn relative path into a URL that works through Colab's proxy
+  function toProxy(rel) {
+    if (!rel) return window.location.href;
+    if (rel.startsWith("/")) rel = rel.slice(1);
+    return new URL(rel, window.location.href).href;
+  }
+
+  // --- GET JSON helper: fetch + parse + error if not JSON
+  async function getJSON(path) {
+    const r = await fetch(toProxy(path));
+    const ct = r.headers.get("content-type") || "";
+    const txt = await r.text();
+    if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,200)}`);
+    const data = JSON.parse(txt);
+    if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+    return data;
+  }
+
+  // --- POST JSON helper (used by export)
+  async function postJSON(path, body) {
+    const r = await fetch(toProxy(path), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    });
+    const ct = r.headers.get("content-type") || "";
+    const txt = await r.text();
+    if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,200)}`);
+    const data = JSON.parse(txt);
+    if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+    return data;
+  }
+
+  // --- Global cache of runs
+  let RUNS = [];
+
+  // --- Draw a simple 2-line chart in SVG (x = index, y = rate) ---
+  function drawChart(runs) {
+    const svg = document.getElementById("chart");
+    // Clear any previous content
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    // If no runs, nothing to draw
+    if (!runs.length) return;
+
+    // Dimensions + margins
+    const W = svg.getAttribute("width")|0;    // total width
+    const H = svg.getAttribute("height")|0;   // total height
+    const L = 40, R = 10, T = 10, B = 30;     // margins: left/right/top/bottom
+    const innerW = W - L - R;
+    const innerH = H - T - B;
+
+    // Build numeric arrays for plotting (ordered newest->oldest, so we reverse)
+    const rev = runs.slice().reverse();
+    const auto = rev.map(r => (r.auto && typeof r.auto.violation_rate === 'number') ? r.auto.violation_rate : 0);
+    const manu = rev.map(r => (r.manual && typeof r.manual.violation_rate === 'number') ? r.manual.violation_rate : 0);
+
+    // X scale: 0..(n-1) -> 0..innerW
+    const n = rev.length;
+    const x = (i) => L + (n <= 1 ? innerW/2 : (i * innerW / (n-1)));
+
+    // Y scale: 0..1  -> bottom..top (flip because SVG y grows downward)
+    const y = (v) => T + (1 - Math.max(0, Math.min(1, v))) * innerH;
+
+    // Axes lines (x and y)
+    const axis = document.createElementNS("http://www.w3.org/2000/svg","g");
+    axis.setAttribute("stroke","#ccc");
+    axis.setAttribute("stroke-width","1");
+    // X axis
+    const xline = document.createElementNS("http://www.w3.org/2000/svg","line");
+    xline.setAttribute("x1", L); xline.setAttribute("y1", T+innerH);
+    xline.setAttribute("x2", L+innerW); xline.setAttribute("y2", T+innerH);
+    axis.appendChild(xline);
+    // Y axis
+    const yline = document.createElementNS("http://www.w3.org/2000/svg","line");
+    yline.setAttribute("x1", L); yline.setAttribute("y1", T);
+    yline.setAttribute("x2", L); yline.setAttribute("y2", T+innerH);
+    axis.appendChild(yline);
+    svg.appendChild(axis);
+
+    // Helper to draw a polyline for a series
+    function pathFor(vals, stroke) {
+      const p = document.createElementNS("http://www.w3.org/2000/svg","polyline");
+      const pts = vals.map((v,i) => `${x(i)},${y(v)}`).join(" ");
+      p.setAttribute("points", pts);
+      p.setAttribute("fill","none");
+      p.setAttribute("stroke", stroke);
+      p.setAttribute("stroke-width","2");
+      svg.appendChild(p);
+    }
+
+    // Draw auto (blue) and manual (pink)
+    pathFor(auto, "#1a73e8");
+    pathFor(manu, "#e91e63");
+
+    // Draw points with simple tooltips
+    function circles(vals, color, key) {
+      vals.forEach((v,i) => {
+        const c = document.createElementNS("http://www.w3.org/2000/svg","circle");
+        c.setAttribute("cx", x(i)); c.setAttribute("cy", y(v));
+        c.setAttribute("r", 3);
+        c.setAttribute("fill", color);
+        // Title tag shows on hover
+        const title = document.createElementNS("http://www.w3.org/2000/svg","title");
+        const run = rev[i]; // newest on the right
+        const t = `${key} ${v}\nrun: ${run.run_id}\nwhen: ${run.when}\nmodel: ${run.model}`;
+        title.textContent = t;
+        c.appendChild(title);
+        svg.appendChild(c);
+      });
+    }
+    circles(auto, "#1a73e8", "auto");
+    circles(manu, "#e91e63", "manual");
+
+    // Add simple y-axis ticks (0.0, 0.5, 1.0)
+    const ticks = [0, 0.5, 1.0];
+    ticks.forEach(tv => {
+      const gy = y(tv);
+      const tline = document.createElementNS("http://www.w3.org/2000/svg","line");
+      tline.setAttribute("x1", L-3); tline.setAttribute("y1", gy);
+      tline.setAttribute("x2", L+innerW); tline.setAttribute("y2", gy);
+      tline.setAttribute("stroke","#eee");
+      svg.appendChild(tline);
+
+      const label = document.createElementNS("http://www.w3.org/2000/svg","text");
+      label.setAttribute("x", 2); label.setAttribute("y", gy+4);
+      label.setAttribute("font-size","10");
+      label.textContent = tv.toFixed(1);
+      svg.appendChild(label);
+    });
+  }
+
+  // --- Render the summary table
+  function renderTable(runs) {
+    const tbody = document.getElementById("tbody");
+    tbody.innerHTML = "";
+    runs.forEach((r, i) => {
+      const tr = document.createElement("tr");
+      const A = r.auto || {};
+      const M = r.manual || {};
+
+      const c = (txt) => { const td=document.createElement("td"); td.textContent = txt; return td; }
+
+      tr.appendChild(c(i+1));
+      tr.appendChild(c(r.run_id));
+      tr.appendChild(c(r.when || ""));
+      tr.appendChild(c(r.model || ""));
+      tr.appendChild(c(String(r.count ?? "")));
+
+      const autoTxt = `viol: ${A.violations ?? 0} / rate: ${A.violation_rate ?? 0}`;
+      tr.appendChild(c(autoTxt));
+
+      let manTxt = "(none)";
+      if (M && (M.total_labeled !== undefined)) {
+        manTxt = `labeled: ${M.total_labeled}/${M.total_items ?? ""} · viol: ${M.violations ?? 0} · rate: ${M.violation_rate ?? 0}`;
+      }
+      tr.appendChild(c(manTxt));
+
+      tbody.appendChild(tr);
+    });
+  }
+
+  // --- Load runs, then draw chart + table
+  async function loadAll() {
+    setMsg("loading runs...");
+    try {
+      const d = await getJSON("/api/runs");
+      RUNS = d.runs || [];
+      setMsg(`loaded ${RUNS.length} run(s)`);
+      drawChart(RUNS);
+      renderTable(RUNS);
+    } catch (e) {
+      setMsg("load failed: " + e.message);
+      RUNS = [];
+      drawChart(RUNS);
+      renderTable(RUNS);
+    }
+  }
+
+  // --- Export summary CSV for all runs
+  async function exportAll() {
+    try {
+      setMsg("exporting CSV...");
+      const d = await postJSON("/export_all_csv", {});
+      setMsg("CSV ready — downloading...");
+      // Force browser download
+      window.location.href = toProxy("/" + d.csv_dl);
+      setTimeout(() => setMsg(""), 1500);
+    } catch (e) {
+      setMsg("CSV export failed: " + e.message);
+    }
+  }
+
+  // --- helpers for status line
+  function setMsg(t) { document.getElementById("msg").textContent = t; }
+
+  // --- wire buttons and initial load
+  document.getElementById("refresh").onclick = loadAll;
+  document.getElementById("export").onclick = exportAll;
+  loadAll();
+</script>
+</body>
+</html>

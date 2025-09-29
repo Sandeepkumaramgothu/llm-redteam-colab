@@ -1,68 +1,103 @@
 # src/app/server.py
 from __future__ import annotations
-import os, sys, json, glob, threading, time, pathlib, html
+
+import os, sys, json, csv, glob, time, html, pathlib, threading
 from zipfile import ZipFile, ZIP_DEFLATED
+from typing import Optional, Tuple, List, Dict, Any
+
 from flask import Flask, jsonify, request, render_template, send_from_directory
 
-# ----- Paths (absolute so CWD doesn't matter) -----
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CFG_PATH = ROOT / "configs" / "baseline.yaml"
 RUNS_DIR = ROOT / "runs"
 TEMPLATES_DIR = ROOT / "src" / "app" / "templates"
 
-# Make src importable
 if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
+    sys.path.insert(0, str(ROOT))
 
-# Core imports
 from src.core.config import load_config
 from src.core.engine import IterationEngine
 from src.core.utils import write_json
 from src.data.seed_loader import prepare_seeds, read_local_auto, read_local_json, read_local_jsonl
 
-# Optional review helpers (labels + recompute)
 _HAS_REVIEW = False
 try:
-    from src.app.review_store import load_interactions as _load_interactions_rs
-    from src.app.review_store import load_labels, recompute_and_write_metrics
+    from src.app.review_store import (
+        load_interactions as _load_interactions_rs,
+        load_labels, save_label, recompute_and_write_metrics,
+    )
     _HAS_REVIEW = True
 except Exception:
-    pass
+    def _load_interactions_rs(run_dir: pathlib.Path): return []
+    def load_labels(run_dir: pathlib.Path): return {}
+    def save_label(run_dir: pathlib.Path, **kwargs): return {"ok": False, "error": "review helpers missing"}
+    def recompute_and_write_metrics(run_dir: pathlib.Path): return {"ok": False, "error": "review helpers missing"}
+
+# ---- Simple on-demand text generation cache (so /api/rerun_item doesn't reload each time)
+_GEN_CACHE = {"name": None, "pipe": None, "task": None}
+
+def _ensure_gen(model_name: str):
+    """
+    Build or reuse a transformers pipeline for 'text-generation' or 'text2text-generation'.
+    Very small convenience so per-item re-runs are snappy.
+    """
+    try:
+        import torch
+        from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, pipeline
+    except Exception as e:
+        raise RuntimeError(f"transformers/torch missing: {e}")
+
+    if _GEN_CACHE["name"] == model_name and _GEN_CACHE["pipe"] is not None:
+        return _GEN_CACHE["pipe"], _GEN_CACHE["task"]
+
+    # Decide the task (causal vs. seq2seq) by model config name
+    cfg = AutoConfig.from_pretrained(model_name, token=os.environ.get("HF_TOKEN", None))
+    archs = [a.lower() for a in (cfg.architectures or [])]
+    is_t5 = any("t5" in a for a in archs)
+    task = "text2text-generation" if is_t5 else "text-generation"
+
+    tok = AutoTokenizer.from_pretrained(model_name, token=os.environ.get("HF_TOKEN", None), use_fast=True)
+    if task == "text2text-generation":
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name, token=os.environ.get("HF_TOKEN", None), device_map="auto"
+        )
+    else:
+        mdl = AutoModelForCausalLM.from_pretrained(
+            model_name, token=os.environ.get("HF_TOKEN", None), device_map="auto"
+        )
+
+    pipe = pipeline(task, model=mdl, tokenizer=tok, device_map="auto")
+    _GEN_CACHE["name"] = model_name
+    _GEN_CACHE["pipe"] = pipe
+    _GEN_CACHE["task"] = task
+    return pipe, task
 
 app = Flask(__name__, template_folder=str(TEMPLATES_DIR))
 _current = {"engine": None, "thread": None}
 
-# ---------- helpers ----------
-def _now_seed() -> int:
-    return time.time_ns() % 1_000_000
-
-def _latest_run_id() -> str | None:
+def _latest_run_id() -> Optional[str]:
     RUNS_DIR.mkdir(exist_ok=True)
     dirs = sorted([p.name for p in RUNS_DIR.glob("*") if p.is_dir()])
     return dirs[-1] if dirs else None
 
-def _resolve_run(run_identifier: str | None):
+def _resolve_run(run_identifier: Optional[str]):
     if not run_identifier:
         rid = _latest_run_id()
-        if not rid:
-            return None
+        if not rid: return None
         return rid, RUNS_DIR / rid
     rid = run_identifier
-    if rid.startswith("runs/"):
-        rid = rid.split("/", 1)[1]
-    return rid, RUNS_DIR / rid
+    if rid.startswith("runs/"): rid = rid.split("/", 1)[1]
+    p = RUNS_DIR / rid
+    return (rid, p) if p.exists() and p.is_dir() else None
 
-def _read_interactions(run_dir: pathlib.Path, limit: int | None = None) -> list[dict]:
-    """Read interactions.jsonl (optionally limit to first K rows)."""
+def _read_interactions(run_dir: pathlib.Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     p = run_dir / "interactions.jsonl"
     out = []
-    if not p.exists():
-        return out
-    with open(p, "r", encoding="utf-8") as f:
+    if not p.exists(): return out
+    with p.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
             line = line.strip()
-            if not line:
-                continue
+            if not line: continue
             try:
                 out.append(json.loads(line))
             except Exception:
@@ -72,21 +107,29 @@ def _read_interactions(run_dir: pathlib.Path, limit: int | None = None) -> list[
     return out
 
 def _clamp(val, lo, hi, default):
-    try:
-        x = float(val)
-    except Exception:
-        return default
+    try: x = float(val)
+    except Exception: return default
     return max(lo, min(hi, x))
 
-# ---------- pages ----------
 @app.get("/")
 def home():
     return render_template("index.html")
 
 @app.get("/review")
 def review_page():
-    # Page exists even if review helpers are missing; buttons will fail gracefully.
     return render_template("review.html")
+
+@app.get("/runs")
+def runs_page():
+    return render_template("runs.html")
+
+@app.get("/dashboard")
+def dashboard_page():
+    return render_template("dashboard.html")
+
+@app.get("/inspect")
+def inspect_page():
+    return render_template("inspect.html")
 
 @app.get("/report")
 def report():
@@ -96,18 +139,16 @@ def report():
         return render_template("report.html", found=False, run_id=None, settings={}, metrics={}, samples=[])
     run_id, run_dir = resolved
 
-    # Load settings/metrics
     settings, metrics = {}, {}
     rp = run_dir / "run_meta.json"
     mt = run_dir / "metrics.json"
     if rp.exists():
-        try: settings = json.load(open(rp, "r", encoding="utf-8"))
+        try: settings = json.load(rp.open("r", encoding="utf-8"))
         except Exception: settings = {}
     if mt.exists():
-        try: metrics = json.load(open(mt, "r", encoding="utf-8"))
+        try: metrics = json.load(mt.open("r", encoding="utf-8"))
         except Exception: metrics = {}
 
-    # Read all samples; attach latest manual label if available
     samples = _read_interactions(run_dir, limit=None)
     labels_map = load_labels(run_dir) if _HAS_REVIEW else {}
     for s in samples:
@@ -118,13 +159,10 @@ def report():
 
     return render_template("report.html", found=True, run_id=f"runs/{run_id}", settings=settings, metrics=metrics, samples=samples)
 
-# ---------- start / status / result ----------
 @app.post("/start")
 def start():
     if _current["thread"] and _current["thread"].is_alive():
         return jsonify({"ok": False, "error": "run_in_progress"}), 400
-
-    # Load YAML config
     try:
         cfg = load_config(str(CFG_PATH))
     except Exception as e:
@@ -132,18 +170,15 @@ def start():
 
     payload = request.get_json(silent=True) or {}
 
-    # Preferred model override
     pm = payload.get("preferred_model")
     if isinstance(pm, str) and pm.strip():
         cfg.models.target_model_name = pm.strip()
 
-    # Local seeds source
     default_local = cfg.paths.seeds_path
     candidates = [default_local, "src/storage/seeds.json", "src/storage/seeds.jsonl"]
     _, chosen_local = read_local_auto(candidates)
     local_src = chosen_local or default_local
 
-    # Seed counts
     seed_source = payload.get("seed_source", "local")
     raw_count   = payload.get("seed_count", None)
     seed_count  = None if (raw_count is None or (isinstance(raw_count, int) and raw_count <= 0)) else int(raw_count)
@@ -153,12 +188,10 @@ def start():
         else:
             seed_count = len(read_local_json(local_src))
 
-    # Generation knobs
     temperature = _clamp(payload.get("temperature", cfg.run.temperature), 0.0, 1.0, cfg.run.temperature)
-    max_tokens  = int(_clamp(payload.get("max_new_tokens", cfg.run.max_new_tokens), 1, 512, cfg.run.max_new_tokens))
+    max_tokens  = int(_clamp(payload.get("max_new_tokens", cfg.run.max_new_tokens), 1, 1024, cfg.run.max_new_tokens))
 
-    # Prepare exact seeds file for this run (rewrite src/storage/seeds.jsonl)
-    shuffle_seed  = int(payload.get("seed", _now_seed()))
+    shuffle_seed  = int(payload.get("seed", time.time_ns() % 1_000_000))
     seeds_out = cfg.paths.seeds_path
     try:
         info = prepare_seeds(
@@ -174,7 +207,6 @@ def start():
     except Exception as e:
         return jsonify({"ok": False, "error": f"seed_prep_failed: {e}"}), 500
 
-    # Process ALL prepared rows in one pass
     try:
         kept = int(info.get("kept", 0))
         if kept > 0:
@@ -186,7 +218,6 @@ def start():
     cfg.run.temperature    = temperature
     cfg.run.max_new_tokens = max_tokens
 
-    # Create engine (load model) with clear JSON error if it fails
     try:
         engine = IterationEngine(cfg)
     except Exception as e:
@@ -194,7 +225,6 @@ def start():
 
     _current["engine"] = engine
 
-    # Save run meta (preferred vs actual)
     try:
         actual_model = getattr(engine.textgen, "model_name", cfg.models.target_model_name)
         meta = {
@@ -210,7 +240,6 @@ def start():
     except Exception:
         pass
 
-    # Run in the background
     def work():
         try:
             engine.run()
@@ -254,35 +283,204 @@ def result():
         }
     })
 
-# ---------- export / zip / shutdown ----------
-@app.post("/export_report")
-def export_report():
-    """Build report.html + index.html inside the run folder and return paths."""
+# -------- Review APIs --------
+@app.get("/api/review_data")
+def api_review_data():
+    run_id = request.args.get("run_id")
+    start  = int(request.args.get("start", 0))
+    limit  = int(request.args.get("limit", 5))
+    resolved = _resolve_run(run_id)
+    if not resolved: return jsonify({"ok": False, "error": "no_runs"}), 400
+    rid, run_dir = resolved
+    items = _load_interactions_rs(run_dir)
+    labels = load_labels(run_dir) if _HAS_REVIEW else {}
+    total = len(items)
+    start = max(0, min(start, max(0, total-1)))
+    end = min(total, start + max(1, limit))
+    sub = []
+    for i in range(start, end):
+        row = dict(items[i])
+        row["label"] = labels.get(int(row.get("index", i)))
+        sub.append(row)
+    return jsonify({"ok": True, "run_id": rid, "total": total, "items": sub})
+
+@app.post("/api/review_save")
+def api_review_save():
+    payload = request.get_json(silent=True) or {}
+    run_id = payload.get("run_id")
+    idx = payload.get("index")
+    if not isinstance(idx, int): return jsonify({"ok": False, "error": "index required"}), 400
+    resolved = _resolve_run(run_id)
+    if not resolved: return jsonify({"ok": False, "error": "no_runs"}), 400
+    rid, run_dir = resolved
+    label = str(payload.get("label", "")).lower()
+    sev = payload.get("severity", None)
+    if isinstance(sev, str) and sev.lower() == "none": sev = None
+    notes = payload.get("notes", None)
+    out = save_label(run_dir, index=idx, label=label, severity=sev, notes=notes)
+    return jsonify(out)
+
+@app.post("/api/recompute_metrics")
+def api_recompute_metrics():
+    payload = request.get_json(silent=True) or {}
+    run_id = payload.get("run_id")
+    resolved = _resolve_run(run_id)
+    if not resolved: return jsonify({"ok": False, "error": "no_runs"}), 400
+    rid, run_dir = resolved
+    out = recompute_and_write_metrics(run_dir)
+    return jsonify(out)
+
+# -------- Inspect APIs --------
+def _revisions_path(run_dir: pathlib.Path, index: int) -> pathlib.Path:
+    d = run_dir / "revisions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"index_{index}.jsonl"
+
+def _read_revisions(run_dir: pathlib.Path, index: int) -> List[Dict[str, Any]]:
+    p = _revisions_path(run_dir, index)
+    out = []
+    if not p.exists(): return out
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try: out.append(json.loads(line))
+            except Exception: pass
+    return out
+
+@app.get("/api/item")
+def api_item():
+    rid_q = request.args.get("run_id")
+    idx = int(request.args.get("index", 0))
+    resolved = _resolve_run(rid_q)
+    if not resolved: return jsonify({"ok": False, "error": "no_runs"}), 400
+    rid, run_dir = resolved
+
+    items = _load_interactions_rs(run_dir)
+    if not items or idx < 0 or idx >= len(items):
+        return jsonify({"ok": False, "error": "index_out_of_range", "total": len(items)}), 400
+
+    row = dict(items[idx])
+    labels = load_labels(run_dir) if _HAS_REVIEW else {}
+    row["label"] = labels.get(int(row.get("index", idx)))
+    hist = _read_revisions(run_dir, idx)
+
+    return jsonify({"ok": True, "run_id": rid, "item": row, "history": hist})
+
+@app.post("/api/rerun_item")
+def api_rerun_item():
+    payload = request.get_json(silent=True) or {}
+    rid_q = payload.get("run_id")
+    idx = int(payload.get("index", 0))
+    model_override = payload.get("preferred_model")
+    temperature = float(payload.get("temperature", 0.7))
+    max_new = int(payload.get("max_new_tokens", 128))
+
+    resolved = _resolve_run(rid_q)
+    if not resolved: return jsonify({"ok": False, "error": "no_runs"}), 400
+    rid, run_dir = resolved
+
+    items = _load_interactions_rs(run_dir)
+    if not items or idx < 0 or idx >= len(items):
+        return jsonify({"ok": False, "error": "index_out_of_range", "total": len(items)}), 400
+
+    prompt = str(items[idx].get("prompt", ""))
+
+    # Decide model: override if provided else config default
+    try:
+        cfg = load_config(str(CFG_PATH))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"config_load_failed: {e}"}), 500
+    model_name = (model_override.strip() if isinstance(model_override, str) and model_override.strip() else cfg.models.target_model_name)
+
+    # Build/reuse pipeline
+    try:
+        pipe, task = _ensure_gen(model_name)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"gen_init_failed: {e}"}), 500
+
+    # Run generation
+    try:
+        if task == "text2text-generation":
+            results = pipe(prompt, max_new_tokens=max_new, temperature=temperature, do_sample=(temperature>0))
+            text = results[0]["generated_text"]
+        else:
+            results = pipe(prompt, max_new_tokens=max_new, temperature=temperature, do_sample=(temperature>0))
+            # For causal LMs, HF may return full prompt+output; take 'generated_text' and strip leading prompt if duplicated
+            text = results[0]["generated_text"]
+            if text.startswith(prompt):
+                text = text[len(prompt):]
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"generation_failed: {e}"}), 500
+
+    # Record revision
+    rec = {
+        "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "model": model_name,
+        "temperature": round(float(temperature), 3),
+        "max_new_tokens": int(max_new),
+        "output": text,
+    }
+    rp = _revisions_path(run_dir, idx)
+    with rp.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    return jsonify({"ok": True, "index": idx, "revision": rec})
+
+# -------- Exports / downloads --------
+@app.post("/export_csv")
+def export_csv():
     try:
         payload = request.get_json(silent=True) or {}
         resolved = _resolve_run(payload.get("run_id"))
-        if not resolved:
-            return jsonify({"ok": False, "error": "no_runs"}), 400
+        if not resolved: return jsonify({"ok": False, "error": "no_runs"}), 400
+        rid, run_dir = resolved
+        items = _read_interactions(run_dir, limit=None)
+        labels_map = load_labels(run_dir) if _HAS_REVIEW else {}
+        csv_path = run_dir / "interactions_labeled.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["index","prompt","output","new_tokens","gen_time_sec","auto_label","auto_hits","manual_label","manual_severity","manual_notes"])
+            for rec in items:
+                auto = rec.get("auto") or {}
+                man  = labels_map.get(int(rec.get("index",-1))) or {}
+                w.writerow([
+                    rec.get("index",""),
+                    rec.get("prompt",""),
+                    rec.get("output",""),
+                    rec.get("new_tokens",""),
+                    rec.get("gen_time_sec",""),
+                    (auto.get("auto_label","") if isinstance(auto,dict) else ""),
+                    ",".join(auto.get("hits",[])) if isinstance(auto,dict) and isinstance(auto.get("hits",[]), list) else "",
+                    (man.get("label","") if isinstance(man,dict) else ""),
+                    (man.get("severity","") if isinstance(man,dict) else ""),
+                    (man.get("notes","") if isinstance(man,dict) else ""),
+                ])
+        return jsonify({"ok": True, "csv_path": f"runs/{rid}/interactions_labeled.csv", "csv_dl": f"dl/{rid}/interactions_labeled.csv"}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.post("/export_report")
+def export_report():
+    try:
+        payload = request.get_json(silent=True) or {}
+        resolved = _resolve_run(payload.get("run_id"))
+        if not resolved: return jsonify({"ok": False, "error": "no_runs"}), 400
         rid, run_dir = resolved
 
-        # Read meta + metrics
         settings, metrics = {}, {}
         rp = run_dir / "run_meta.json"
         mt = run_dir / "metrics.json"
         if rp.exists():
-            try: settings = json.load(open(rp, "r", encoding="utf-8"))
+            try: settings = json.load(rp.open("r", encoding="utf-8"))
             except Exception: settings = {}
         if mt.exists():
-            try: metrics = json.load(open(mt, "r", encoding="utf-8"))
+            try: metrics = json.load(mt.open("r", encoding="utf-8"))
             except Exception: metrics = {}
 
-        # Read all items
         items = _read_interactions(run_dir, limit=None)
-
-        # Manual labels (if module available)
         labels_map = load_labels(run_dir) if _HAS_REVIEW else {}
 
-        # Build table rows (with escaping)
         rows_html = []
         for i, rec in enumerate(items, start=1):
             prompt = html.escape(rec.get("prompt",""))
@@ -291,29 +489,19 @@ def export_report():
             auto_label = html.escape(str(auto.get("auto_label","")))
             auto_hits  = ",".join(auto.get("hits", [])) if isinstance(auto.get("hits"), list) else ""
             auto_hits  = html.escape(auto_hits)
-
             man = labels_map.get(int(rec.get("index", -1)), {})
             man_label = html.escape(str(man.get("label",""))) if isinstance(man, dict) else ""
             man_sev   = man.get("severity", None) if isinstance(man, dict) else None
             man_notes = html.escape(str(man.get("notes",""))) if isinstance(man, dict) and man.get("notes") else ""
-
             per = f"{rec.get('new_tokens','')} tok / {rec.get('gen_time_sec','')} s"
             per = html.escape(per)
-
-            row = (
-                f"<tr>"
-                f"<td>{i}</td>"
-                f"<td class='mono'>{prompt}</td>"
-                f"<td class='mono'>{output}</td>"
+            rows_html.append(
+                f"<tr><td>{i}</td><td class='mono'>{prompt}</td><td class='mono'>{output}</td>"
                 f"<td>{auto_label}{(' — ' + auto_hits) if auto_hits else ''}</td>"
-                f"<td>{man_label}{(' (sev ' + str(man_sev) + ')') if (isinstance(man_sev,int)) else ''}"
-                f"{(' — ' + man_notes) if man_notes else ''}</td>"
-                f"<td>{per}</td>"
-                f"</tr>"
+                f"<td>{man_label}{(' (sev ' + str(man_sev) + ')') if (isinstance(man_sev,int)) else ''}{(' — ' + man_notes) if man_notes else ''}</td>"
+                f"<td>{per}</td></tr>"
             )
-            rows_html.append(row)
 
-        # Compose the HTML
         def esc(x): return html.escape("" if x is None else str(x))
         manual = (metrics.get("manual") or {})
         auto   = (metrics.get("auto") or {})
@@ -324,8 +512,7 @@ def export_report():
         th,td{{border:1px solid #ddd;padding:6px;vertical-align:top}}
         th{{background:#f6f6f6}}
         .box{{border:1px solid #ddd;padding:10px;border-radius:8px;margin:10px 0;background:#fafafa}}
-        a{{color:#1a73e8;text-decoration:none}}
-        a:hover{{text-decoration:underline}}
+        a{{color:#1a73e8;text-decoration:none}} a:hover{{text-decoration:underline}}
         </style><body>
         <p><a href="/">← Back to Home</a></p>
         <h2>Run Report</h2>
@@ -362,12 +549,58 @@ def export_report():
           {''.join(rows_html)}
         </table>
         </body></html>"""
-
-        # Write out
         (run_dir / "report.html").write_text(html_out, encoding="utf-8")
         (run_dir / "index.html").write_text(html_out, encoding="utf-8")
-
         return jsonify({"ok": True, "report_path": f"runs/{rid}/report.html", "report_dl": f"dl/{rid}/report.html"}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.post("/export_all_csv")
+def export_all_csv():
+    try:
+        RUNS_DIR.mkdir(exist_ok=True)
+        out_path = RUNS_DIR / "_summary_all_runs.csv"
+        rows = []
+        for d in sorted([p for p in RUNS_DIR.glob("*") if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+            rid = d.name
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d.stat().st_mtime))
+            metrics, meta = {}, {}
+            mp = d / "metrics.json"
+            rp = d / "run_meta.json"
+            if mp.exists():
+                try: metrics = json.load(mp.open("r", encoding="utf-8"))
+                except Exception: metrics = {}
+            if rp.exists():
+                try: meta = json.load(rp.open("r", encoding="utf-8"))
+                except Exception: meta = {}
+            auto   = metrics.get("auto") or {}
+            manual = metrics.get("manual") or {}
+            rows.append({
+                "run_id": rid, "when": when,
+                "model": meta.get("actual_model") or meta.get("preferred_model") or "",
+                "count": metrics.get("count"),
+                "total_new_tokens": metrics.get("total_new_tokens"),
+                "auto_violations": auto.get("violations"),
+                "auto_violation_rate": auto.get("violation_rate"),
+                "manual_total_labeled": manual.get("total_labeled"),
+                "manual_violations": manual.get("violations"),
+                "manual_violation_rate": manual.get("violation_rate"),
+                "manual_avg_severity": manual.get("avg_severity"),
+            })
+        with out_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "run_id","when","model","count","total_new_tokens",
+                "auto_violations","auto_violation_rate",
+                "manual_total_labeled","manual_violations","manual_violation_rate","manual_avg_severity"
+            ])
+            for r in rows:
+                w.writerow([
+                    r["run_id"], r["when"], r["model"], r["count"], r["total_new_tokens"],
+                    r["auto_violations"], r["auto_violation_rate"],
+                    r["manual_total_labeled"], r["manual_violations"], r["manual_violation_rate"], r["manual_avg_severity"]
+                ])
+        return jsonify({"ok": True, "csv_path": "runs/_summary_all_runs.csv", "csv_dl": "dl/_summary_all_runs.csv"}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -376,8 +609,7 @@ def zip_run():
     try:
         payload = request.get_json(silent=True) or {}
         resolved = _resolve_run(payload.get("run_id"))
-        if not resolved:
-            return jsonify({"ok": False, "error": "no_runs"}), 400
+        if not resolved: return jsonify({"ok": False, "error": "no_runs"}), 400
         rid, run_dir = resolved
         if not run_dir.exists():
             return jsonify({"ok": False, "error": f"missing run dir: {run_dir}"}), 400
@@ -393,66 +625,47 @@ def zip_run():
 
 @app.post("/shutdown")
 def shutdown():
-    """Stop the Flask server process (used by the Stop button)."""
     try:
-        def _exit_soon():
-            time.sleep(0.3); os._exit(0)
-        threading.Thread(target=_exit_soon, daemon=True).start()
+        def _exit(): time.sleep(0.3); os._exit(0)
+        threading.Thread(target=_exit, daemon=True).start()
         return jsonify({"ok": True, "msg": "server will stop"}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ---------- review APIs (only if helper module is available) ----------
-if _HAS_REVIEW:
-    @app.get("/api/review_data")
-    def api_review_data():
-        run_id = request.args.get("run_id")
-        start  = int(request.args.get("start", 0))
-        limit  = int(request.args.get("limit", 1))
-        resolved = _resolve_run(run_id)
-        if not resolved:
-            return jsonify({"ok": False, "error": "no_runs"}), 400
-        rid, run_dir = resolved
-        items = _load_interactions_rs(run_dir)
-        labels = load_labels(run_dir)
-        total = len(items)
-        start = max(0, min(start, max(0, total-1)))
-        end = min(total, start + max(1, limit))
-        sub = []
-        for i in range(start, end):
-            row = dict(items[i])
-            row["label"] = labels.get(i)
-            sub.append(row)
-        return jsonify({"ok": True, "run_id": rid, "total": total, "items": sub})
+@app.get("/runs/<path:subpath>")
+def serve_runs(subpath: str):
+    return send_from_directory(str(RUNS_DIR), subpath, as_attachment=False)
 
-    @app.post("/api/review_save")
-    def api_review_save():
-        payload = request.get_json(silent=True) or {}
-        run_id = payload.get("run_id")
-        idx = payload.get("index")
-        if not isinstance(idx, int):
-            return jsonify({"ok": False, "error": "index required"}), 400
-        resolved = _resolve_run(run_id)
-        if not resolved:
-            return jsonify({"ok": False, "error": "no_runs"}), 400
-        rid, run_dir = resolved
-        from src.app.review_store import save_label
-        label = str(payload.get("label", "safe")).lower()
-        severity = payload.get("severity", None)
-        notes = payload.get("notes", None)
-        out = save_label(run_dir, index=idx, label=label, severity=severity, notes=notes)
-        return jsonify(out)
+@app.get("/dl/<path:subpath>")
+def download_runs(subpath: str):
+    return send_from_directory(str(RUNS_DIR), subpath, as_attachment=True)
 
-    @app.post("/api/recompute_metrics")
-    def api_recompute_metrics():
-        payload = request.get_json(silent=True) or {}
-        run_id = payload.get("run_id")
-        resolved = _resolve_run(run_id)
-        if not resolved:
-            return jsonify({"ok": False, "error": "no_runs"}), 400
-        rid, run_dir = resolved
-        out = recompute_and_write_metrics(run_dir)
-        return jsonify(out)
+@app.get("/api/runs")
+def api_runs():
+    RUNS_DIR.mkdir(exist_ok=True)
+    rows = []
+    for d in sorted([p for p in RUNS_DIR.glob("*") if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+        rid = d.name
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d.stat().st_mtime))
+        metrics, meta = {}, {}
+        mp = d / "metrics.json"
+        rp = d / "run_meta.json"
+        if mp.exists():
+            try: metrics = json.load(mp.open("r", encoding="utf-8"))
+            except Exception: metrics = {}
+        if rp.exists():
+            try: meta = json.load(rp.open("r", encoding="utf-8"))
+            except Exception: meta = {}
+        rows.append({
+            "run_id": rid,
+            "when": when,
+            "model": meta.get("actual_model") or meta.get("preferred_model") or "",
+            "count": metrics.get("count"),
+            "total_new_tokens": metrics.get("total_new_tokens"),
+            "auto": metrics.get("auto") or {},
+            "manual": metrics.get("manual") or {},
+        })
+    return jsonify({"ok": True, "runs": rows})
 
 def run_app(port: int = 8000):
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)

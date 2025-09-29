@@ -1,0 +1,183 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Inspect & Re-run</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+    .row { margin: 10px 0; }
+    .box { border: 1px solid #ddd; padding: 12px; border-radius: 8px; background: #fafafa; margin: 12px 0; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+    button { padding: 6px 10px; margin-right: 6px; }
+    input, select, textarea { padding: 6px 8px; }
+    textarea { width: 100%; min-height: 80px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eee; margin-right: 6px; }
+    .muted { color: #666; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .rev { border-left: 3px solid #ccc; padding-left: 10px; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <p><a href="/">← Back to Home</a></p>
+  <h2>Inspect & Re-run</h2>
+
+  <!-- Controls to select the item -->
+  <div class="box">
+    <div class="row">
+      <label>Run ID:
+        <input id="run_id" placeholder="(leave blank for latest)">
+      </label>
+      <label>Item index:
+        <input id="idx" type="number" value="0" min="0" style="width:100px">
+      </label>
+      <button id="load">Load item</button>
+      <span id="msg" class="muted"></span>
+    </div>
+  </div>
+
+  <!-- Item details (prompt/output/labels) -->
+  <div class="box">
+    <h3>Item</h3>
+    <div id="item"></div>
+  </div>
+
+  <!-- Re-run controls -->
+  <div class="box">
+    <h3>Re-run this prompt</h3>
+    <div class="row">
+      <label>Preferred model:
+        <input id="model" placeholder="leave blank to use config/default">
+      </label>
+    </div>
+    <div class="row">
+      <label>Temperature: <input id="temp" type="number" step="0.05" min="0" max="1" value="0.7" style="width:100px"></label>
+      <label>Max new tokens: <input id="max_new" type="number" min="1" max="1024" value="128" style="width:120px"></label>
+      <button id="rerun">Re-run</button>
+    </div>
+    <div id="rn_msg" class="muted"></div>
+  </div>
+
+  <!-- History -->
+  <div class="box">
+    <h3>History</h3>
+    <div id="history"></div>
+  </div>
+
+<script>
+  // Build a URL via Colab's proxy
+  function toProxy(rel) {
+    if (!rel) return window.location.href;
+    if (rel.startsWith("/")) rel = rel.slice(1);
+    return new URL(rel, window.location.href).href;
+  }
+
+  // GET JSON helper
+  async function getJSON(path) {
+    const r = await fetch(toProxy(path));
+    const ct = r.headers.get("content-type") || "";
+    const txt = await r.text();
+    if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,200)}`);
+    const data = JSON.parse(txt);
+    if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+    return data;
+  }
+
+  // POST JSON helper
+  async function postJSON(path, body) {
+    const r = await fetch(toProxy(path), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    });
+    const ct = r.headers.get("content-type") || "";
+    const txt = await r.text();
+    if (!ct.includes("application/json")) throw new Error(`HTTP ${r.status} ${ct} :: ${txt.slice(0,200)}`);
+    const data = JSON.parse(txt);
+    if (!r.ok || data.ok === false) throw new Error((data && data.error) || `HTTP ${r.status}`);
+    return data;
+  }
+
+  function esc(x){ return (x==null ? "" : String(x)).replaceAll("<","&lt;"); }
+
+  // Render the current item
+  function renderItem(d) {
+    const it = d.item || {};
+    const lab = it.label || {};
+    const el = document.getElementById("item");
+    el.innerHTML = `
+      <div class="row"><span class="pill">#${esc(it.index)}</span>
+        <span class="pill">new toks: ${esc(it.new_tokens)}</span>
+        <span class="pill">gen time: ${esc(it.gen_time_sec)} s</span></div>
+      <div class="grid">
+        <div><h4>Prompt</h4><div class="mono">${esc(it.prompt)}</div></div>
+        <div><h4>Original Output</h4><div class="mono">${esc(it.output)}</div></div>
+      </div>
+      <p class="muted">Manual: ${esc(lab.label)} ${lab.severity!=null? "(sev "+lab.severity+")":""} ${lab.notes? " — "+esc(lab.notes):""}</p>
+    `;
+  }
+
+  // Render the history list
+  function renderHistory(d) {
+    const h = d.history || [];
+    const cont = document.getElementById("history");
+    if (!h.length) { cont.textContent = "(no re-runs yet)"; return; }
+    cont.innerHTML = "";
+    h.forEach((r, i) => {
+      const div = document.createElement("div");
+      div.className = "rev";
+      div.innerHTML = `
+        <div><b>#${i+1}</b> — ${esc(r.when)} — model: ${esc(r.model)} — temp: ${esc(r.temperature)} — max: ${esc(r.max_new_tokens)}</div>
+        <div class="mono">${esc(r.output)}</div>
+      `;
+      cont.appendChild(div);
+    });
+  }
+
+  // Load button handler
+  async function doLoad() {
+    try {
+      document.getElementById("msg").textContent = "loading...";
+      const rid = (document.getElementById("run_id").value || null);
+      const idx = parseInt(document.getElementById("idx").value || "0", 10);
+      const d = await getJSON(`/api/item?run_id=${encodeURIComponent(rid ?? "")}&index=${idx}`);
+      renderItem(d);
+      renderHistory(d);
+      document.getElementById("msg").textContent = `Loaded item #${idx} from run ${d.run_id}`;
+    } catch (e) {
+      document.getElementById("msg").textContent = "load failed: " + e.message;
+      document.getElementById("item").textContent = "";
+      document.getElementById("history").textContent = "";
+    }
+  }
+
+  // Re-run button handler
+  async function doRerun() {
+    try {
+      document.getElementById("rn_msg").textContent = "generating...";
+      const rid = (document.getElementById("run_id").value || null);
+      const idx = parseInt(document.getElementById("idx").value || "0", 10);
+      const model = document.getElementById("model").value || null;
+      const temp = parseFloat(document.getElementById("temp").value);
+      const maxn = parseInt(document.getElementById("max_new").value, 10);
+      const out = await postJSON("/api/rerun_item", {
+        run_id: rid, index: idx,
+        preferred_model: model, temperature: temp, max_new_tokens: maxn
+      });
+      // After rerun, reload the item so history updates.
+      await doLoad();
+      document.getElementById("rn_msg").textContent = "done";
+      setTimeout(() => { document.getElementById("rn_msg").textContent = ""; }, 1200);
+    } catch (e) {
+      document.getElementById("rn_msg").textContent = "rerun failed: " + e.message;
+    }
+  }
+
+  // Wire buttons
+  document.getElementById("load").onclick = doLoad;
+  document.getElementById("rerun").onclick = doRerun;
+
+  // On first open, try to load latest run, item 0
+  doLoad();
+</script>
+</body>
+</html>

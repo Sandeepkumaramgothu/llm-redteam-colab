@@ -1,147 +1,118 @@
 # src/app/review_store.py
-"""
-This module handles reading/writing manual labels for a run and recomputing
-metrics from those labels.
-
-Files we care about inside runs/<run_id>/:
-- interactions.jsonl  -> model outputs per item (index, prompt, output, etc.)
-- labels.jsonl        -> your manual labels (one JSON object per line)
-- metrics.json        -> summary metrics (we add a "manual" section)
-
-A "label record" looks like:
-  {"index": 5, "label": "violation", "severity": 4, "notes": "leakage", "ts": 1695600000.0}
-"""
-
 from __future__ import annotations
-import time, json, pathlib
-from typing import List, Dict, Any, Optional
+import json, pathlib, statistics
+from typing import Dict, Any, List, Optional
 
-def _p(path: str | pathlib.Path) -> pathlib.Path:
-    """Tiny helper: always return a pathlib.Path object."""
-    return path if isinstance(path, pathlib.Path) else pathlib.Path(path)
+def _labels_path(run_dir: pathlib.Path) -> pathlib.Path:
+    """labels.jsonl inside runs/<id>"""
+    return run_dir / "labels.jsonl"
 
-def load_interactions(run_dir: str | pathlib.Path) -> List[Dict[str, Any]]:
-    """Read interactions.jsonl into a list of dicts."""
-    p = _p(run_dir) / "interactions.jsonl"
+def load_interactions(run_dir: pathlib.Path) -> List[Dict[str, Any]]:
+    """
+    Return list of dicts from interactions.jsonl.
+    Guarantees each row has an 'index' (0-based) even if file didn’t have it.
+    """
+    ip = run_dir / "interactions.jsonl"
     out: List[Dict[str, Any]] = []
-    if not p.exists():
+    if not ip.exists():
         return out
-    with open(p, "r", encoding="utf-8") as f:
-        for line in f:
+    with ip.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
             line = line.strip()
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
+                obj = json.loads(line)
             except Exception:
-                pass
+                continue
+            # Ensure an index (engine normally writes one; we add if missing)
+            if "index" not in obj or not isinstance(obj["index"], int):
+                obj["index"] = i
+            out.append(obj)
     return out
 
-def load_labels(run_dir: str | pathlib.Path) -> Dict[int, Dict[str, Any]]:
+def load_labels(run_dir: pathlib.Path) -> Dict[int, Dict[str, Any]]:
     """
-    Read labels.jsonl and return a dict mapping index -> latest label record.
-    If the same index appears multiple times, keep the last one (most recent).
+    Read labels.jsonl (append-only log).
+    Return: { index -> latest_label_dict }
+    Each label row looks like:
+      {"index": 12, "label": "safe"|"violation", "severity": int|None, "notes": str|None}
     """
-    p = _p(run_dir) / "labels.jsonl"
+    p = _labels_path(run_dir)
     latest: Dict[int, Dict[str, Any]] = {}
     if not p.exists():
         return latest
-    with open(p, "r", encoding="utf-8") as f:
+    with p.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                rec = json.loads(line)
-                if isinstance(rec, dict) and isinstance(rec.get("index"), int):
-                    latest[rec["index"]] = rec
+                obj = json.loads(line)
             except Exception:
-                pass
+                continue
+            idx = obj.get("index", None)
+            if isinstance(idx, int):
+                latest[idx] = {
+                    "label": str(obj.get("label","")).lower(),
+                    "severity": obj.get("severity", None),
+                    "notes": obj.get("notes", None),
+                }
     return latest
 
-def save_label(run_dir: str | pathlib.Path, *, index: int, label: str, severity: Optional[int], notes: Optional[str]) -> Dict[str, Any]:
+def save_label(run_dir: pathlib.Path, *, index: int, label: str, severity: Optional[int], notes: Optional[str]) -> Dict[str, Any]:
     """
-    Append/update a label for a specific item index.
-    We store a line in labels.jsonl. We also keep a compact index->record map
-    by re-reading the file (simple and safe for our usage).
+    Append one label to labels.jsonl; latest entry wins.
+    Returns the snapshot for that index after write.
     """
-    runp = _p(run_dir)
-    runp.mkdir(parents=True, exist_ok=True)
-    lp = runp / "labels.jsonl"
-    # Build the record we want to append
-    rec = {
-        "index": int(index),
-        "label": str(label),
-        "severity": int(severity) if isinstance(severity, int) else None,
-        "notes": "" if notes is None else str(notes),
-        "ts": time.time(),
-    }
-    # Append to file
-    with open(lp, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    # Return the latest map so caller can show the current state
-    return {"ok": True, "latest": load_labels(runp)}
+    row = {"index": int(index), "label": str(label).lower(), "severity": severity, "notes": notes}
+    p = _labels_path(run_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    snap = load_labels(run_dir).get(int(index))
+    return {"ok": True, "index": int(index), "label": snap}
 
-def compute_manual_metrics(labels_map: Dict[int, Dict[str, Any]], *, total_items: Optional[int] = None) -> Dict[str, Any]:
+def recompute_and_write_metrics(run_dir: pathlib.Path) -> Dict[str, Any]:
     """
-    Given the latest labels (index->record), compute some useful numbers:
-      - total_labeled: how many items have a label
-      - violations: how many labeled as "violation"
-      - violation_rate: violations / total_labeled
-      - avg_severity: average severity among violation-labeled items (if any)
+    Compute manual metrics from labels and merge them into runs/<id>/metrics.json under 'manual'.
+    Also ensures metrics.json exists even if engine didn’t write it yet.
     """
-    total_labeled = len(labels_map)
-    if total_labeled == 0:
-        return {
-            "total_items": total_items,
-            "total_labeled": 0,
-            "violations": 0,
-            "violation_rate": 0.0,
-            "avg_severity": None,
-        }
-    # Count violations and collect severities
-    vio = 0
-    severities = []
-    for rec in labels_map.values():
-        if str(rec.get("label","")).lower() == "violation":
-            vio += 1
-            sev = rec.get("severity", None)
-            if isinstance(sev, int):
-                severities.append(sev)
-    violation_rate = float(vio) / float(total_labeled) if total_labeled > 0 else 0.0
-    avg_sev = (sum(severities) / len(severities)) if severities else None
-    return {
-        "total_items": total_items,
-        "total_labeled": total_labeled,
-        "violations": vio,
-        "violation_rate": round(violation_rate, 4),
-        "avg_severity": round(avg_sev, 3) if isinstance(avg_sev, float) else avg_sev,
-    }
+    items = load_interactions(run_dir)
+    labels = load_labels(run_dir)
 
-def recompute_and_write_metrics(run_dir: str | pathlib.Path) -> Dict[str, Any]:
-    """
-    Load current metrics.json (if exists), merge in a 'manual' section computed
-    from labels.jsonl, and write it back to metrics.json.
-    """
-    runp = _p(run_dir)
-    metrics_path = runp / "metrics.json"
-    labels_map = load_labels(runp)
-    items = load_interactions(runp)
-    manual = compute_manual_metrics(labels_map, total_items=len(items))
+    total_items = len(items)
+    labeled_idxs = list(labels.keys())
+    total_labeled = len(labeled_idxs)
+    violations = 0
+    severities: List[int] = []
 
-    # Read existing metrics, if any
+    for idx in labeled_idxs:
+        lab = labels.get(idx) or {}
+        if str(lab.get("label","")).lower() in ("violation", "unsafe", "fail"):
+            violations += 1
+        sev = lab.get("severity", None)
+        if isinstance(sev, int):
+            severities.append(sev)
+
+    violation_rate = (violations / total_labeled) if total_labeled > 0 else 0.0
+    avg_severity = statistics.mean(severities) if severities else None
+
+    mp = run_dir / "metrics.json"
     metrics = {}
-    if metrics_path.exists():
+    if mp.exists():
         try:
-            metrics = json.load(open(metrics_path, "r", encoding="utf-8"))
+            metrics = json.load(mp.open("r", encoding="utf-8"))
         except Exception:
             metrics = {}
-
-    # Merge manual section
-    metrics["manual"] = manual
-
-    # Write back metrics.json
-    with open(metrics_path, "w", encoding="utf-8") as f:
+    metrics["manual"] = {
+        "total_items": total_items,
+        "total_labeled": total_labeled,
+        "violations": violations,
+        "violation_rate": round(violation_rate, 4),
+        "avg_severity": avg_severity,
+    }
+    with mp.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    return {"ok": True, "manual": manual}
+    return {"ok": True, "manual": metrics["manual"]}
